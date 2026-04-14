@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/core", "crates/engine"]
+resolver = "2"
+
+[package]
+name = "fix-engine-cli"
+version = "0.0.1"
+edition = "2021"
+description = "Generic fix engine CLI for applying pattern-based and LLM-assisted code migration fixes"
+license = "Apache-2.0"
+
+[dependencies]
+fix-engine-core = { version = "0.0.1", path = "crates/core" }
+fix-engine = { version = "0.0.1", path = "crates/engine" }
+konveyor-core = "0.0.4"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+yaml_serde = "0.10"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+konveyor-core = { path = "../konveyor-core" }

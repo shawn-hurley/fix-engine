@@ -1,0 +1,30 @@
+[package]
+name = "fix-engine"
+version = "0.0.1"
+edition = "2021"
+description = "Language-agnostic fix engine for applying pattern-based and LLM-assisted code migration fixes"
+license = "Apache-2.0"
+
+[dependencies]
+fix-engine-core = { version = "0.0.1", path = "../core" }
+konveyor-core = "0.0.4"
+
+# Error handling
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP client (for LLM endpoint)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities
+regex = "1"
+
+# Logging
+tracing = "0.1"
+
+# Unix process management (process group cleanup for goose subprocess)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
