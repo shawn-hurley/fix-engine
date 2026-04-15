@@ -72,6 +72,10 @@ pub struct FixPlan {
     pub manual: Vec<ManualFixItem>,
     /// Incidents pending LLM-assisted fix.
     pub pending_llm: Vec<LlmFixRequest>,
+    /// Number of edits removed during plan-time deduplication because a more
+    /// specific edit on the same line already covers the same text region.
+    #[serde(default)]
+    pub edits_subsumed: usize,
 }
 
 /// An incident that requires manual fixing.
@@ -108,8 +112,10 @@ pub struct FixResult {
     pub files_modified: usize,
     /// Number of edits applied.
     pub edits_applied: usize,
-    /// Number of edits skipped (already applied or conflict).
+    /// Number of edits skipped (line out of bounds or text not found).
     pub edits_skipped: usize,
+    /// Number of edits subsumed by a more specific edit on the same line.
+    pub edits_subsumed: usize,
     /// Errors encountered.
     pub errors: Vec<String>,
 }

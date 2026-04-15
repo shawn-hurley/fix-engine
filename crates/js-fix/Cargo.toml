@@ -1,0 +1,17 @@
+[package]
+name = "fix-engine-js-fix"
+version = "0.0.1"
+edition = "2021"
+description = "JS/TS/JSX/TSX language-specific fix operations for the fix engine"
+license = "Apache-2.0"
+
+[dependencies]
+fix-engine-core = { version = "0.0.1", path = "../core" }
+fix-engine = { version = "0.0.1", path = "../engine" }
+konveyor-core = "0.0.4"
+
+# Serialization (for incident variable inspection)
+serde_json = "1"
+
+# Utilities
+regex = "1"

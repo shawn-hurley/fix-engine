@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use fix_engine::engine as engine;
 use fix_engine::goose_client;
 use fix_engine::llm_client;
-use fix_engine::language::NoOpLanguageFixProvider;
+use fix_engine_js_fix::JsFixProvider;
 use fix_engine::registry::FixContextRegistry;
 
 #[derive(Args)]
@@ -159,8 +159,8 @@ pub async fn run(opts: FixOpts) -> Result<()> {
         eprintln!("  Total family strategies: {}", family_entries.len());
     }
 
-    // Generic language provider (no language-specific optimizations)
-    let lang = NoOpLanguageFixProvider;
+    // JS/TS/JSX/TSX language provider with prop removal, import dedup, etc.
+    let lang = JsFixProvider::new();
 
     // Phase 1: Plan fixes
     eprintln!("Planning fixes...");
@@ -210,6 +210,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
         let result = engine::apply_fixes(&plan, &lang)?;
         eprintln!("  Files modified: {}", result.files_modified);
         eprintln!("  Edits applied:  {}", result.edits_applied);
+        eprintln!("  Edits subsumed: {}", result.edits_subsumed);
         eprintln!("  Edits skipped:  {}", result.edits_skipped);
         if !result.errors.is_empty() {
             eprintln!("  Errors:");

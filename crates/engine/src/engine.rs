@@ -163,7 +163,145 @@ pub fn plan_fixes(
         fixes.sort_by(|a, b| b.line.cmp(&a.line));
     }
 
+    // Deduplicate overlapping edits: when multiple edits target the same line
+    // and one edit's old_text is a substring of another's, the more specific
+    // (longer old_text) edit wins. This handles the CSS rule cascade where a
+    // specific rename rule, a prefix stale rule, and a class prefix rule all
+    // target the same variable on the same line.
+    deduplicate_edits(&mut plan);
+
     Ok(plan)
+}
+
+/// Remove edits that are subsumed by a more specific edit on the same line.
+///
+/// Two edits on the same line are considered overlapping when one's `old_text`
+/// is a substring of the other's. The more specific edit (longer `old_text`)
+/// wins because it produces a more precise replacement. The subsumed edit is
+/// removed from the plan and counted in `plan.edits_subsumed`.
+///
+/// When two edits share the same `old_text` but have different `new_text`
+/// (conflicting edits), the first in specificity order is kept.
+///
+/// Exact duplicates (same line, old_text, new_text) are also removed.
+fn deduplicate_edits(plan: &mut FixPlan) {
+    let mut total_subsumed: usize = 0;
+
+    for fixes in plan.files.values_mut() {
+        // Collect all edits across all PlannedFixes for this file, tracking
+        // which PlannedFix and edit index they came from.
+        struct EditRef {
+            fix_idx: usize,
+            edit_idx: usize,
+            line: u32,
+            old_text: String,
+            new_text: String,
+        }
+
+        let mut all_edits: Vec<EditRef> = Vec::new();
+        for (fix_idx, fix) in fixes.iter().enumerate() {
+            for (edit_idx, edit) in fix.edits.iter().enumerate() {
+                all_edits.push(EditRef {
+                    fix_idx,
+                    edit_idx,
+                    line: edit.line,
+                    old_text: edit.old_text.clone(),
+                    new_text: edit.new_text.clone(),
+                });
+            }
+        }
+
+        // Group by line number
+        let mut by_line: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, er) in all_edits.iter().enumerate() {
+            by_line.entry(er.line).or_default().push(i);
+        }
+
+        // For each line, determine which edits to remove
+        let mut remove_set: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+
+        for indices in by_line.values() {
+            if indices.len() <= 1 {
+                continue;
+            }
+
+            // Sort by old_text length descending (most specific first),
+            // then by old_text alphabetically for deterministic ordering
+            let mut sorted: Vec<usize> = indices.clone();
+            sorted.sort_by(|&a, &b| {
+                let ea = &all_edits[a];
+                let eb = &all_edits[b];
+                eb.old_text
+                    .len()
+                    .cmp(&ea.old_text.len())
+                    .then_with(|| ea.old_text.cmp(&eb.old_text))
+            });
+
+            // Walk in specificity order. Keep the first edit for each
+            // non-overlapping text region. Subsume edits whose old_text
+            // is a substring of a kept edit's old_text, or whose old_text
+            // matches a kept edit's old_text (conflict: first wins).
+            let mut kept: Vec<usize> = Vec::new();
+            let mut kept_old_texts: Vec<String> = Vec::new();
+            // Track (old_text) already seen to handle same-old-text conflicts
+            let mut seen_old: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            for &idx in &sorted {
+                let er = &all_edits[idx];
+
+                // Exact duplicate: same old_text AND same new_text as a kept edit
+                let dominated = kept.iter().any(|&k| {
+                    let ek = &all_edits[k];
+                    ek.old_text == er.old_text && ek.new_text == er.new_text
+                });
+                if dominated {
+                    remove_set.insert((er.fix_idx, er.edit_idx));
+                    total_subsumed += 1;
+                    continue;
+                }
+
+                // Conflict: same old_text but different new_text — first wins
+                if seen_old.contains(&er.old_text) {
+                    remove_set.insert((er.fix_idx, er.edit_idx));
+                    total_subsumed += 1;
+                    continue;
+                }
+
+                // Subsumed: this edit's old_text is a substring of a kept edit's old_text
+                let subsumed = kept_old_texts
+                    .iter()
+                    .any(|kept_old| kept_old.contains(&er.old_text));
+                if subsumed {
+                    remove_set.insert((er.fix_idx, er.edit_idx));
+                    total_subsumed += 1;
+                    continue;
+                }
+
+                // Keep this edit
+                kept.push(idx);
+                kept_old_texts.push(er.old_text.clone());
+                seen_old.insert(er.old_text.clone());
+            }
+        }
+
+        // Remove subsumed edits from PlannedFixes (iterate in reverse to preserve indices)
+        if !remove_set.is_empty() {
+            for (fix_idx, fix) in fixes.iter_mut().enumerate() {
+                let mut edit_idx = fix.edits.len();
+                while edit_idx > 0 {
+                    edit_idx -= 1;
+                    if remove_set.contains(&(fix_idx, edit_idx)) {
+                        fix.edits.remove(edit_idx);
+                    }
+                }
+            }
+            // Remove PlannedFixes that have no remaining edits
+            fixes.retain(|f| !f.edits.is_empty());
+        }
+    }
+
+    plan.edits_subsumed = total_subsumed;
 }
 
 /// Consolidate LLM fix requests by component family when a family-level
@@ -327,6 +465,17 @@ pub fn consolidate_family_requests(
                 }
             }
 
+            // Preserve per-incident fix strategy context (e.g., PropTypeChange
+            // from/to mappings) so the LLM knows exactly what rename or type
+            // change to apply alongside the family migration.
+            if let Some(strat_start) = req.message.find("\n\nFix strategy:") {
+                let strat_section = &req.message[strat_start..];
+                message.push_str("    Fix strategy:\n");
+                for line in strat_section.trim().lines().skip(1) {
+                    message.push_str(&format!("      {}\n", line.trim()));
+                }
+            }
+
             if let Some(snip) = &req.code_snip {
                 all_snips.push((req.line, snip.clone()));
             }
@@ -381,7 +530,10 @@ pub fn consolidate_family_requests(
 ///
 /// `lang` provides language-specific post-processing (e.g., import deduplication).
 pub fn apply_fixes(plan: &FixPlan, lang: &dyn LanguageFixProvider) -> Result<FixResult> {
-    let mut result = FixResult::default();
+    let mut result = FixResult {
+        edits_subsumed: plan.edits_subsumed,
+        ..FixResult::default()
+    };
 
     for (file_path, fixes) in &plan.files {
         let source = match std::fs::read_to_string(file_path) {
@@ -855,5 +1007,61 @@ mod tests {
         assert!(requests[0]
             .message
             .contains("mastheadbrand-signature-changed"),);
+    }
+
+    #[test]
+    fn test_consolidate_preserves_fix_strategy_context() {
+        let mut requests = vec![{
+            let mut req = make_llm_request(
+                "menutoggle-splitbuttonoptions-changed",
+                "/src/ToolbarBulkSelector.tsx",
+                134,
+                vec!["family=MenuToggle", "change-type=prop-type-changed"],
+            );
+            // Simulate the enriched message with both incident context and fix strategy
+            req.message = "property splitButtonOptions was replaced by splitButtonItems\n\n\
+                Incident context:\n  componentName: MenuToggle\n  propName: splitButtonOptions\n\n\
+                Fix strategy:\nStrategy: PropTypeChange\nComponent: MenuToggle\n\
+                Prop: splitButtonOptions\nFrom: property: splitButtonOptions: SplitButtonOptions\n\
+                To: property: splitButtonItems: ReactNode[]"
+                .to_string();
+            req
+        }];
+
+        let mut families = BTreeMap::new();
+        families.insert(
+            "family:MenuToggle".to_string(),
+            make_family_entry(
+                "<MenuToggle splitButtonItems={...} />",
+                vec!["MenuToggleAction"],
+            ),
+        );
+
+        consolidate_family_requests(&mut requests, &families);
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].rule_id, "family:MenuToggle");
+        // Verify incident context variables are preserved
+        assert!(
+            requests[0].message.contains("componentName: MenuToggle"),
+            "incident context variables should be preserved"
+        );
+        // Verify fix strategy context is preserved (this was previously dropped)
+        assert!(
+            requests[0].message.contains("Strategy: PropTypeChange"),
+            "fix strategy type should be preserved"
+        );
+        assert!(
+            requests[0]
+                .message
+                .contains("From: property: splitButtonOptions: SplitButtonOptions"),
+            "fix strategy 'from' should be preserved"
+        );
+        assert!(
+            requests[0]
+                .message
+                .contains("To: property: splitButtonItems: ReactNode[]"),
+            "fix strategy 'to' should be preserved"
+        );
     }
 }
