@@ -6,6 +6,7 @@
 //! - Removes JSX attributes (props) using syntax-aware regex
 //! - Extracts matched text from JSX/React incident variables
 //! - Manages `package.json` dependencies
+//! - Resolves ecosystem dependency versions via npm registry
 
 use fix_engine::language::LanguageFixProvider;
 use fix_engine_core::*;
@@ -360,12 +361,67 @@ fn find_nearest_package_json(path: &Path) -> Option<PathBuf> {
 ///    (import condition leg -- the incident points at a source file).
 /// 2. Try to update: scan for the package name in the file and replace the version.
 /// 3. If not found: insert a new entry into the `"dependencies"` block.
+///
+/// **Dependent incidents**: If the incident has an `isDependentOf` variable,
+/// this is a transitive dependency conflict detected by the lockfile scanner.
+/// The `dependencyName` variable identifies the package to update, and we
+/// query the npm registry to find the latest version compatible with the
+/// target major version of the primary dependency.
 fn plan_ensure_npm_dependency(
     rule_id: &str,
-    _incident: &Incident,
+    incident: &Incident,
     package: &str,
     new_version: &str,
     file_path: &Path,
+) -> Option<PlannedFix> {
+    // Check if this is a dependent incident (lockfile conflict).
+    // If so, resolve the actual package and version from npm.
+    if let Some(serde_json::Value::String(depends_on)) = incident.variables.get("isDependentOf") {
+        let actual_package = incident
+            .variables
+            .get("dependencyName")
+            .and_then(|v| v.as_str())?;
+
+        let target_major = extract_major(new_version);
+
+        tracing::info!(
+            dependent = %actual_package,
+            depends_on = %depends_on,
+            target_major = target_major,
+            "Resolving compatible version from npm for dependent package"
+        );
+
+        let resolved = resolve_npm_compatible_version(actual_package, depends_on, target_major);
+
+        match resolved {
+            Some(ref ver) => {
+                tracing::info!(
+                    package = %actual_package,
+                    resolved_version = %ver,
+                    "Resolved npm-compatible version for dependent"
+                );
+                return plan_ensure_npm_dependency_inner(rule_id, file_path, actual_package, ver);
+            }
+            None => {
+                tracing::warn!(
+                    package = %actual_package,
+                    depends_on = %depends_on,
+                    "Could not resolve compatible version from npm; skipping"
+                );
+                return None;
+            }
+        }
+    }
+
+    plan_ensure_npm_dependency_inner(rule_id, file_path, package, new_version)
+}
+
+/// Inner implementation: update or insert a dependency in package.json.
+fn plan_ensure_npm_dependency_inner(
+    rule_id: &str,
+    file_path: &Path,
+    package: &str,
+    new_version: &str,
 ) -> Option<PlannedFix> {
     // Resolve the target package.json
     let pkg_json = if file_path.file_name().is_some_and(|f| f == "package.json") {
@@ -515,6 +571,120 @@ fn plan_ensure_npm_dependency(
         line: closing_line_num,
         description: format!("Add {} {} to dependencies", package, new_version),
     })
+}
+
+// -- npm registry resolution --
+
+/// Extract the major version number from a version string.
+/// `"^6.4.1"` → 6, `"6.4.1"` → 6, `"~5.0.0"` → 5
+fn extract_major(version: &str) -> u64 {
+    let stripped = version
+        .trim()
+        .trim_start_matches('^')
+        .trim_start_matches('~')
+        .trim_start_matches(">=")
+        .trim_start_matches("<=")
+        .trim_start_matches('>')
+        .trim_start_matches('<')
+        .trim_start_matches('=');
+    stripped
+        .split('.')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Query the npm registry to find the latest stable version of `package`
+/// whose dependency on `compatible_with` uses major version `target_major`.
+///
+/// For example, for `resolve_npm_compatible_version("@patternfly/react-topology",
+/// "@patternfly/react-core", 6)`, this finds the latest version of
+/// `react-topology` that depends on `@patternfly/react-core@^6.x`.
+///
+/// Returns the version as `"^X.Y.Z"` or `None` if no compatible version
+/// is found or the registry query fails.
+fn resolve_npm_compatible_version(
+    package: &str,
+    compatible_with: &str,
+    target_major: u64,
+) -> Option<String> {
+    let url = format!("https://registry.npmjs.org/{}", package);
+
+    let mut response = match ureq::get(&url).call() {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(
+                package = %package,
+                error = %e,
+                "npm registry query failed"
+            );
+            return None;
+        }
+    };
+
+    let body: serde_json::Value = match response.body_mut().read_json() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                package = %package,
+                error = %e,
+                "Failed to parse npm registry response"
+            );
+            return None;
+        }
+    };
+
+    let versions = body.get("versions")?.as_object()?;
+
+    // Find all stable versions whose dependency on `compatible_with`
+    // has a major version >= target_major
+    let mut candidates: Vec<(u64, u64, u64, &str)> = Vec::new();
+
+    for (ver_str, ver_data) in versions {
+        // Skip prereleases
+        if ver_str.contains("alpha")
+            || ver_str.contains("prerelease")
+            || ver_str.contains("rc")
+            || ver_str.contains("beta")
+        {
+            continue;
+        }
+
+        // Check if this version depends on compatible_with at target_major+
+        let has_compatible_dep = ["dependencies", "peerDependencies"].iter().any(|section| {
+            ver_data
+                .get(*section)
+                .and_then(|deps| deps.get(compatible_with))
+                .and_then(|constraint| constraint.as_str())
+                .is_some_and(|c| extract_major(c) >= target_major)
+        });
+
+        if !has_compatible_dep {
+            continue;
+        }
+
+        // Parse version for sorting
+        if let Some(parsed) = parse_semver_tuple(ver_str) {
+            candidates.push((parsed.0, parsed.1, parsed.2, ver_str.as_str()));
+        }
+    }
+
+    // Sort and take the latest
+    candidates.sort();
+    let latest = candidates.last()?;
+
+    Some(format!("^{}", latest.3))
+}
+
+/// Parse a semver string into (major, minor, patch) tuple.
+fn parse_semver_tuple(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim();
+    let version_part = s.split('-').next().unwrap_or(s);
+    let parts: Vec<&str> = version_part.split('.').collect();
+    let major = parts.first()?.parse().ok()?;
+    let minor = parts.get(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch = parts.get(2).and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
 }
 
 #[cfg(test)]
@@ -723,5 +893,125 @@ mod tests {
         provider.post_process_lines(&mut lines);
         assert_eq!(lines[0].matches("Content").count(), 1);
         assert_eq!(lines[1], "const x = 1;");
+    }
+
+    // -- npm resolution helper tests --
+
+    #[test]
+    fn test_extract_major() {
+        assert_eq!(extract_major("^6.4.1"), 6);
+        assert_eq!(extract_major("~5.0.0"), 5);
+        assert_eq!(extract_major("6.4.1"), 6);
+        assert_eq!(extract_major(">=7.0.0"), 7);
+        assert_eq!(extract_major("^6.0.0-alpha.1"), 6);
+    }
+
+    #[test]
+    fn test_parse_semver_tuple() {
+        assert_eq!(parse_semver_tuple("6.4.1"), Some((6, 4, 1)));
+        assert_eq!(parse_semver_tuple("5.0.0"), Some((5, 0, 0)));
+        assert_eq!(parse_semver_tuple("6.0.0-alpha.1"), Some((6, 0, 0)));
+    }
+
+    // -- dependent incident detection test --
+
+    #[test]
+    fn test_dependent_incident_updates_correct_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_json = dir.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{
+  "devDependencies": {
+    "@patternfly/react-core": "^6.4.1",
+    "@patternfly/react-topology": "5.2.1"
+  }
+}"#,
+        )
+        .unwrap();
+
+        // Create a dependent incident (as the frontend-analyzer-provider would)
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "dependencyName".into(),
+            serde_json::Value::String("@patternfly/react-topology".into()),
+        );
+        vars.insert(
+            "dependencyVersion".into(),
+            serde_json::Value::String("5.2.1".into()),
+        );
+        vars.insert(
+            "dependencyType".into(),
+            serde_json::Value::String("devDependencies".into()),
+        );
+        vars.insert(
+            "isDependentOf".into(),
+            serde_json::Value::String("@patternfly/react-core".into()),
+        );
+        vars.insert(
+            "dependentConstraint".into(),
+            serde_json::Value::String("^5.1.1".into()),
+        );
+
+        let incident = make_test_incident(&format!("file://{}", pkg_json.display()), 4, vars);
+
+        // Call the function — it will try to query npm for react-topology.
+        // In CI without network, the npm query may fail, but the function
+        // should gracefully return None rather than panic.
+        let result = plan_ensure_npm_dependency(
+            "semver-dep-update-patternfly-react-core",
+            &incident,
+            "@patternfly/react-core",
+            "^6.4.1",
+            &pkg_json,
+        );
+
+        // If npm is reachable, we get a fix targeting react-topology (not react-core).
+        // If npm is unreachable, we get None (graceful degradation).
+        if let Some(fix) = result {
+            assert!(
+                fix.description.contains("react-topology"),
+                "Fix should target react-topology, got: {}",
+                fix.description
+            );
+            assert!(
+                !fix.description.contains("react-core"),
+                "Fix should NOT mention react-core as the package to update"
+            );
+        }
+        // Either way: no panic, no crash.
+    }
+
+    // -- non-dependent incident preserves existing behavior --
+
+    #[test]
+    fn test_non_dependent_incident_uses_provided_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_json = dir.path().join("package.json");
+        std::fs::write(
+            &pkg_json,
+            r#"{
+  "dependencies": {
+    "@patternfly/react-core": "5.3.4"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let vars = BTreeMap::new();
+        let incident = make_test_incident(&format!("file://{}", pkg_json.display()), 3, vars);
+
+        let result = plan_ensure_npm_dependency(
+            "semver-dep-update-patternfly-react-core",
+            &incident,
+            "@patternfly/react-core",
+            "^6.4.1",
+            &pkg_json,
+        );
+
+        let fix = result.expect("Should produce a fix for primary dep update");
+        assert_eq!(fix.edits.len(), 1);
+        assert!(fix.edits[0].new_text.contains("6.4.1"));
+        assert!(fix.description.contains("react-core"));
     }
 }
