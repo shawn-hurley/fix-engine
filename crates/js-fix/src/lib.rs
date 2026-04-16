@@ -411,8 +411,10 @@ fn plan_ensure_npm_dependency(
         // Get the set of direct dep names from package.json
         let direct_deps = lockfile::parse_direct_dep_names(&pkg_json);
 
-        // Find which lockfile entries depend on the target package
-        let all_parents = lockfile::find_dependent_packages(file_path, package);
+        // Find which lockfile entries transitively depend on the target package.
+        // This walks up the dependency chain: if A → B → C and C is the target,
+        // both A and B are returned as ancestors.
+        let all_parents = lockfile::find_transitive_ancestor_packages(file_path, package);
 
         // Filter to only direct deps (we can only update what's in package.json)
         let actionable_parents: Vec<&String> = all_parents
@@ -760,16 +762,29 @@ fn resolve_npm_compatible_version(
             continue;
         }
 
-        // Check if this version depends on compatible_with at target_major+
-        let has_compatible_dep = ["dependencies", "peerDependencies"].iter().any(|section| {
-            ver_data
-                .get(*section)
-                .and_then(|deps| deps.get(compatible_with))
-                .and_then(|constraint| constraint.as_str())
-                .is_some_and(|c| extract_major(c) >= target_major)
-        });
+        // Check if this version is compatible with the target major of
+        // compatible_with. A version is compatible if:
+        // 1. It declares compatible_with at target_major+ (explicit compat), OR
+        // 2. It doesn't declare compatible_with at all (the dep was dropped,
+        //    meaning no version constraint — implicitly compatible with any version)
+        //
+        // A version is INCOMPATIBLE only if it explicitly constrains
+        // compatible_with to a major version below target_major.
+        let dep_constraint = ["dependencies", "peerDependencies"]
+            .iter()
+            .find_map(|section| {
+                ver_data
+                    .get(*section)
+                    .and_then(|deps| deps.get(compatible_with))
+                    .and_then(|c| c.as_str())
+            });
 
-        if !has_compatible_dep {
+        let is_compatible = match dep_constraint {
+            Some(c) => extract_major(c) >= target_major,
+            None => true, // dep dropped — no constraint, implicitly compatible
+        };
+
+        if !is_compatible {
             continue;
         }
 
