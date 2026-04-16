@@ -570,9 +570,25 @@ pub fn apply_fixes(plan: &FixPlan, lang: &dyn LanguageFixProvider) -> Result<Fix
                         result.edits_applied += 1;
                         any_changed = true;
                     } else {
+                        tracing::debug!(
+                            file = %file_path.display(),
+                            line = edit.line,
+                            rule = %edit.rule_id,
+                            old_text = %edit.old_text,
+                            actual_line = %line,
+                            "Edit skipped: old_text not found on line"
+                        );
                         result.edits_skipped += 1;
                     }
                 } else {
+                    tracing::debug!(
+                        file = %file_path.display(),
+                        line = edit.line,
+                        rule = %edit.rule_id,
+                        old_text = %edit.old_text,
+                        total_lines = lines.len(),
+                        "Edit skipped: line index out of bounds"
+                    );
                     result.edits_skipped += 1;
                 }
             }
@@ -808,9 +824,20 @@ fn plan_import_path_change(
     incident: &Incident,
     old_path: &str,
     new_path: &str,
-    _file_path: &PathBuf,
+    file_path: &PathBuf,
 ) -> Option<PlannedFix> {
     let line = incident.line_number?;
+
+    // Only create an edit if the incident line actually contains the old path.
+    // ImportPathChange incidents fire on import lines, type references, and
+    // JSX usage sites — only import lines contain the package path string.
+    let source = std::fs::read_to_string(file_path).ok()?;
+    let lines: Vec<&str> = source.lines().collect();
+    let idx = (line as usize).saturating_sub(1);
+    let file_line = lines.get(idx)?;
+    if !file_line.contains(old_path) {
+        return None;
+    }
 
     Some(PlannedFix {
         edits: vec![TextEdit {
