@@ -838,20 +838,70 @@ fn plan_import_path_change(
 ) -> Option<PlannedFix> {
     let line = incident.line_number?;
 
-    // Only create an edit if the incident line actually contains the old path.
-    // ImportPathChange incidents fire on import lines, type references, and
-    // JSX usage sites — only import lines contain the package path string.
     let source = std::fs::read_to_string(file_path).ok()?;
     let lines: Vec<&str> = source.lines().collect();
     let idx = (line as usize).saturating_sub(1);
     let file_line = lines.get(idx)?;
-    if !file_line.contains(old_path) {
-        return None;
-    }
+
+    // Determine which line contains the import path to rewrite.
+    //
+    // For single-line imports the incident line itself has the path:
+    //   import { Chart } from '@patternfly/react-charts';
+    //
+    // For multi-line imports the incident fires on a specifier line while
+    // the package path lives on the `from` line further down:
+    //   import {
+    //     Chart,          <-- incident line
+    //     ChartAxis,
+    //   } from '@patternfly/react-charts';   <-- old_path is here
+    //
+    // Strategy: if the incident line doesn't contain old_path, scan backwards
+    // for `{` or `import` to confirm we're inside an import block, then scan
+    // forward for the `from` clause that holds the package path.
+    let target_line = if file_line.contains(old_path) {
+        // Single-line import (or the incident already points at the from-line).
+        // Guard against double-application: if new_path is already present
+        // (e.g. old_path is a prefix of new_path), skip.
+        if file_line.contains(new_path) {
+            return None;
+        }
+        line
+    } else {
+        // Multi-line import: verify we are inside an import/export block
+        // by scanning backwards (up to 50 lines) for `{` or `import`.
+        let in_import_block = (0..idx).rev().take(50).any(|i| {
+            let l = lines[i];
+            l.contains('{')
+                || l.trim_start().starts_with("import")
+                || l.trim_start().starts_with("export")
+        });
+        if !in_import_block {
+            return None;
+        }
+
+        // Scan forward from the incident line for the `from` clause.
+        let from_idx = (idx..lines.len()).take(50).find(|&i| {
+            let trimmed = lines[i].trim_start();
+            trimmed.starts_with("} from ")
+                || trimmed.starts_with("from ")
+                || (trimmed.contains(" from '") || trimmed.contains(" from \""))
+        })?;
+
+        let from_line = lines[from_idx];
+        if !from_line.contains(old_path) {
+            return None; // Not our import
+        }
+        // Guard against double-application on the from-line.
+        if from_line.contains(new_path) {
+            return None;
+        }
+
+        (from_idx + 1) as u32 // convert to 1-indexed
+    };
 
     Some(PlannedFix {
         edits: vec![TextEdit {
-            line,
+            line: target_line,
             old_text: old_path.to_string(),
             new_text: new_path.to_string(),
             rule_id: rule_id.to_string(),
@@ -862,7 +912,7 @@ fn plan_import_path_change(
         source: FixSource::Pattern,
         rule_id: rule_id.to_string(),
         file_uri: incident.file_uri.clone(),
-        line,
+        line: target_line,
         description: format!("Change import path to '{}'", new_path),
     })
 }
@@ -1044,6 +1094,233 @@ mod tests {
         assert!(requests[0]
             .message
             .contains("mastheadbrand-signature-changed"),);
+    }
+
+    // -- plan_import_path_change tests --
+
+    fn make_incident(file_uri: &str, line: u32) -> Incident {
+        Incident {
+            file_uri: file_uri.to_string(),
+            line_number: Some(line),
+            code_location: None,
+            message: String::new(),
+            code_snip: None,
+            variables: Default::default(),
+            effort: None,
+            links: Vec::new(),
+            is_dependency_incident: false,
+        }
+    }
+
+    #[test]
+    fn test_import_path_change_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("single.tsx");
+        std::fs::write(&file, "import { Chart } from '@patternfly/react-charts';\n").unwrap();
+
+        let incident = make_incident("file://single.tsx", 1);
+        let fix = plan_import_path_change(
+            "test-rule",
+            &incident,
+            "@patternfly/react-charts",
+            "@patternfly/react-charts/victory",
+            &file,
+        );
+
+        let fix = fix.expect("should produce a fix for single-line import");
+        assert_eq!(fix.edits.len(), 1);
+        assert_eq!(fix.edits[0].line, 1);
+        assert_eq!(fix.edits[0].old_text, "@patternfly/react-charts");
+        assert_eq!(fix.edits[0].new_text, "@patternfly/react-charts/victory");
+    }
+
+    #[test]
+    fn test_import_path_change_multiline_specifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("multi.tsx");
+        std::fs::write(
+            &file,
+            "\
+import {
+  Chart,
+  ChartAxis,
+  ChartBar,
+} from '@patternfly/react-charts';
+import { Button } from '@patternfly/react-core';
+",
+        )
+        .unwrap();
+
+        // Incident fires on line 2 (Chart specifier), but the from-clause
+        // is on line 5.
+        let incident = make_incident("file://multi.tsx", 2);
+        let fix = plan_import_path_change(
+            "test-rule",
+            &incident,
+            "@patternfly/react-charts",
+            "@patternfly/react-charts/victory",
+            &file,
+        );
+
+        let fix = fix.expect("should produce a fix for multi-line import");
+        assert_eq!(fix.edits.len(), 1);
+        assert_eq!(
+            fix.edits[0].line, 5,
+            "edit should target the from-clause line"
+        );
+        assert_eq!(fix.edits[0].old_text, "@patternfly/react-charts");
+        assert_eq!(fix.edits[0].new_text, "@patternfly/react-charts/victory");
+    }
+
+    #[test]
+    fn test_import_path_change_multiline_different_specifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("multi2.tsx");
+        std::fs::write(
+            &file,
+            "\
+import {
+  Chart,
+  ChartAxis,
+  ChartBar,
+} from '@patternfly/react-charts';
+",
+        )
+        .unwrap();
+
+        // Incident on line 4 (ChartBar specifier) should also resolve to line 5.
+        let incident = make_incident("file://multi2.tsx", 4);
+        let fix = plan_import_path_change(
+            "test-rule",
+            &incident,
+            "@patternfly/react-charts",
+            "@patternfly/react-charts/victory",
+            &file,
+        );
+
+        let fix = fix.expect("should produce a fix for any specifier in multi-line import");
+        assert_eq!(fix.edits[0].line, 5);
+    }
+
+    #[test]
+    fn test_import_path_change_already_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("migrated.tsx");
+        std::fs::write(
+            &file,
+            "import { Chart } from '@patternfly/react-charts/victory';\n",
+        )
+        .unwrap();
+
+        let incident = make_incident("file://migrated.tsx", 1);
+        let fix = plan_import_path_change(
+            "test-rule",
+            &incident,
+            "@patternfly/react-charts",
+            "@patternfly/react-charts/victory",
+            &file,
+        );
+
+        assert!(fix.is_none(), "should skip already-migrated imports");
+    }
+
+    #[test]
+    fn test_import_path_change_multiline_already_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("migrated_multi.tsx");
+        std::fs::write(
+            &file,
+            "\
+import {
+  Chart,
+  ChartAxis,
+} from '@patternfly/react-charts/victory';
+",
+        )
+        .unwrap();
+
+        let incident = make_incident("file://migrated_multi.tsx", 2);
+        let fix = plan_import_path_change(
+            "test-rule",
+            &incident,
+            "@patternfly/react-charts",
+            "@patternfly/react-charts/victory",
+            &file,
+        );
+
+        assert!(
+            fix.is_none(),
+            "should skip already-migrated multi-line imports"
+        );
+    }
+
+    #[test]
+    fn test_import_path_change_non_import_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("jsx.tsx");
+        std::fs::write(
+            &file,
+            "\
+import { Chart } from '@patternfly/react-charts';
+
+function App() {
+  return <Chart />;
+}
+",
+        )
+        .unwrap();
+
+        // Incident on line 4 (JSX usage), no import block above within scope.
+        let incident = make_incident("file://jsx.tsx", 4);
+        let fix = plan_import_path_change(
+            "test-rule",
+            &incident,
+            "@patternfly/react-charts",
+            "@patternfly/react-charts/victory",
+            &file,
+        );
+
+        // The backward scan WILL find `import` on line 1 and `{` on line 3
+        // (the function body). The forward scan from line 4 won't find a
+        // `from` clause with the old path, so it should return None or
+        // find the wrong thing. Either way, the from-line won't contain
+        // old_path so it should safely return None.
+        // Actually, the backward scan finds `{` on line 3, confirming
+        // "import block". Then forward scan looks for `from`, which doesn't
+        // appear. So find returns None, and the `?` propagates.
+        assert!(
+            fix.is_none(),
+            "should not produce a fix for non-import JSX usage"
+        );
+    }
+
+    #[test]
+    fn test_import_path_change_export_reexport() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("reexport.tsx");
+        std::fs::write(
+            &file,
+            "\
+export {
+  Chart,
+  ChartAxis,
+} from '@patternfly/react-charts';
+",
+        )
+        .unwrap();
+
+        let incident = make_incident("file://reexport.tsx", 2);
+        let fix = plan_import_path_change(
+            "test-rule",
+            &incident,
+            "@patternfly/react-charts",
+            "@patternfly/react-charts/victory",
+            &file,
+        );
+
+        let fix = fix.expect("should handle export re-exports");
+        assert_eq!(fix.edits[0].line, 4);
+        assert_eq!(fix.edits[0].old_text, "@patternfly/react-charts");
     }
 
     #[test]

@@ -28,3 +28,6 @@ tracing = "0.1"
 # Unix process management (process group cleanup for goose subprocess)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
