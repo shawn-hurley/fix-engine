@@ -55,9 +55,18 @@ pub fn plan_fixes(
 
                 match &strategy {
                     FixStrategy::Rename(mappings) => {
-                        if let Some(fix) =
+                        if let Some(mut fix) =
                             plan_rename(rule_id, incident, mappings, &file_path, lang)
                         {
+                            // Import renames: the old name appears in both the
+                            // import specifier AND the module path (e.g.,
+                            // `import { OLD } from '.../dist/js/OLD'`). Replace
+                            // all occurrences so both are updated.
+                            if incident.variables.contains_key("importedName") {
+                                for edit in &mut fix.edits {
+                                    edit.replace_all = true;
+                                }
+                            }
                             plan.files.entry(file_path).or_default().push(fix);
                         }
                     }
