@@ -3,11 +3,11 @@ use clap::Args;
 use fix_engine_core::FixSource;
 use std::path::PathBuf;
 
-use fix_engine::engine as engine;
+use fix_engine::engine;
 use fix_engine::goose_client;
 use fix_engine::llm_client;
-use fix_engine_js_fix::JsFixProvider;
 use fix_engine::registry::FixContextRegistry;
+use fix_engine_js_fix::JsFixProvider;
 
 #[derive(Args)]
 pub struct FixOpts {

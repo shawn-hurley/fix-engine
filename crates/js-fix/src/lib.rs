@@ -7,6 +7,9 @@
 //! - Extracts matched text from JSX/React incident variables
 //! - Manages `package.json` dependencies
 //! - Resolves ecosystem dependency versions via npm registry
+//! - Resolves transitive dependency conflicts from lockfiles
+
+mod lockfile;
 
 use fix_engine::language::LanguageFixProvider;
 use fix_engine_core::*;
@@ -58,7 +61,7 @@ impl LanguageFixProvider for JsFixProvider {
         package: &str,
         new_version: &str,
         file_path: &Path,
-    ) -> Option<PlannedFix> {
+    ) -> Vec<PlannedFix> {
         plan_ensure_npm_dependency(rule_id, incident, package, new_version, file_path)
     }
 
@@ -356,31 +359,133 @@ fn find_nearest_package_json(path: &Path) -> Option<PathBuf> {
 
 /// Ensure a dependency exists at the correct version in `package.json`.
 ///
-/// 1. If `file_path` is a `package.json`, use it directly (dependency condition leg).
-///    Otherwise walk up from `file_path` to find the nearest `package.json`
-///    (import condition leg -- the incident points at a source file).
-/// 2. Try to update: scan for the package name in the file and replace the version.
-/// 3. If not found: insert a new entry into the `"dependencies"` block.
+/// Three paths:
 ///
-/// **Dependent incidents**: If the incident has an `isDependentOf` variable,
-/// this is a transitive dependency conflict detected by the lockfile scanner.
-/// The `dependencyName` variable identifies the package to update, and we
-/// query the npm registry to find the latest version compatible with the
-/// target major version of the primary dependency.
+/// 1. **Lockfile incident** (URI points to a lockfile): The incident fired on a
+///    transitive copy of the package. Parse the lockfile to find which direct
+///    deps in `package.json` pull it in, resolve their latest compatible
+///    versions from npm, and plan updates for those parent packages.
+///
+/// 2. **Dependent incident** (has `isDependentOf` variable): Legacy path for
+///    transitive conflicts detected by the lockfile scanner in the provider.
+///    Resolves the actual package from `dependencyName` via npm.
+///
+/// 3. **Direct incident** (URI points to `package.json` or source file): Update
+///    or insert the package in `package.json` with the given version.
 fn plan_ensure_npm_dependency(
     rule_id: &str,
     incident: &Incident,
     package: &str,
     new_version: &str,
     file_path: &Path,
-) -> Option<PlannedFix> {
-    // Check if this is a dependent incident (lockfile conflict).
-    // If so, resolve the actual package and version from npm.
+) -> Vec<PlannedFix> {
+    // ── Path 1: Lockfile incident ────────────────────────────────────
+    //
+    // When the incident URI points to a lockfile (yarn.lock, package-lock.json,
+    // pnpm-lock.yaml), the rule fired on a transitive copy of `package` (e.g.,
+    // a nested @patternfly/react-core@5.x pulled in by react-topology).
+    //
+    // Instead of redundantly updating the target package (the direct incident
+    // handles that), we find which direct deps bring in the transitive copy
+    // and update those parent packages to versions compatible with the new
+    // major version of the target.
+    if lockfile::is_lockfile(file_path) {
+        tracing::info!(
+            package = %package,
+            lockfile = %file_path.display(),
+            "Lockfile incident: resolving parent packages for transitive dependency"
+        );
+
+        // Find the sibling package.json
+        let pkg_json = match find_nearest_package_json(file_path) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    lockfile = %file_path.display(),
+                    "No package.json found near lockfile; skipping"
+                );
+                return Vec::new();
+            }
+        };
+
+        // Get the set of direct dep names from package.json
+        let direct_deps = lockfile::parse_direct_dep_names(&pkg_json);
+
+        // Find which lockfile entries depend on the target package
+        let all_parents = lockfile::find_dependent_packages(file_path, package);
+
+        // Filter to only direct deps (we can only update what's in package.json)
+        let actionable_parents: Vec<&String> = all_parents
+            .iter()
+            .filter(|name| direct_deps.contains(name.as_str()))
+            .collect();
+
+        if actionable_parents.is_empty() {
+            tracing::debug!(
+                package = %package,
+                "No direct-dep parents found for transitive lockfile dep; skipping"
+            );
+            return Vec::new();
+        }
+
+        let target_major = extract_major(new_version);
+        let mut fixes = Vec::new();
+
+        for parent in &actionable_parents {
+            tracing::info!(
+                parent = %parent,
+                compatible_with = %package,
+                target_major = target_major,
+                "Resolving npm-compatible version for lockfile parent"
+            );
+
+            let resolved = resolve_npm_compatible_version(parent, package, target_major);
+
+            match resolved {
+                Some(ref ver) => {
+                    tracing::info!(
+                        parent = %parent,
+                        resolved_version = %ver,
+                        "Resolved npm-compatible version for lockfile parent"
+                    );
+                    if let Some(fix) =
+                        plan_ensure_npm_dependency_inner(rule_id, &pkg_json, parent, ver)
+                    {
+                        fixes.push(fix);
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        parent = %parent,
+                        compatible_with = %package,
+                        "Could not resolve compatible version from npm; skipping parent"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            package = %package,
+            parents = actionable_parents.len(),
+            fixes = fixes.len(),
+            "Lockfile incident resolved"
+        );
+
+        return fixes;
+    }
+
+    // ── Path 2: Dependent incident (isDependentOf variable) ──────────
+    //
+    // Legacy path for transitive conflicts with explicit variables.
     if let Some(serde_json::Value::String(depends_on)) = incident.variables.get("isDependentOf") {
-        let actual_package = incident
+        let actual_package = match incident
             .variables
             .get("dependencyName")
-            .and_then(|v| v.as_str())?;
+            .and_then(|v| v.as_str())
+        {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
 
         let target_major = extract_major(new_version);
 
@@ -393,14 +498,16 @@ fn plan_ensure_npm_dependency(
 
         let resolved = resolve_npm_compatible_version(actual_package, depends_on, target_major);
 
-        match resolved {
+        return match resolved {
             Some(ref ver) => {
                 tracing::info!(
                     package = %actual_package,
                     resolved_version = %ver,
                     "Resolved npm-compatible version for dependent"
                 );
-                return plan_ensure_npm_dependency_inner(rule_id, file_path, actual_package, ver);
+                plan_ensure_npm_dependency_inner(rule_id, file_path, actual_package, ver)
+                    .into_iter()
+                    .collect()
             }
             None => {
                 tracing::warn!(
@@ -408,12 +515,15 @@ fn plan_ensure_npm_dependency(
                     depends_on = %depends_on,
                     "Could not resolve compatible version from npm; skipping"
                 );
-                return None;
+                Vec::new()
             }
-        }
+        };
     }
 
+    // ── Path 3: Direct incident ──────────────────────────────────────
     plan_ensure_npm_dependency_inner(rule_id, file_path, package, new_version)
+        .into_iter()
+        .collect()
 }
 
 /// Inner implementation: update or insert a dependency in package.json.
@@ -967,8 +1077,8 @@ mod tests {
         );
 
         // If npm is reachable, we get a fix targeting react-topology (not react-core).
-        // If npm is unreachable, we get None (graceful degradation).
-        if let Some(fix) = result {
+        // If npm is unreachable, we get an empty vec (graceful degradation).
+        if let Some(fix) = result.first() {
             assert!(
                 fix.description.contains("react-topology"),
                 "Fix should target react-topology, got: {}",
@@ -1009,7 +1119,12 @@ mod tests {
             &pkg_json,
         );
 
-        let fix = result.expect("Should produce a fix for primary dep update");
+        assert_eq!(
+            result.len(),
+            1,
+            "Should produce exactly one fix for primary dep update"
+        );
+        let fix = &result[0];
         assert_eq!(fix.edits.len(), 1);
         assert!(fix.edits[0].new_text.contains("6.4.1"));
         assert!(fix.description.contains("react-core"));

@@ -100,13 +100,16 @@ pub fn plan_fixes(
                     } => {
                         // Delegate to the language provider for ecosystem-specific
                         // dependency management (package.json, Cargo.toml, go.mod, etc.)
-                        if let Some(fix) = lang.plan_ensure_dependency(
+                        // A single incident may produce multiple fixes (e.g., a lockfile
+                        // incident resolving multiple parent packages to update).
+                        let fixes = lang.plan_ensure_dependency(
                             rule_id,
                             incident,
                             package,
                             new_version,
                             &file_path,
-                        ) {
+                        );
+                        for fix in fixes {
                             let dep_file = fix.file_uri.clone();
                             let dep_path = uri_to_path(&dep_file, project_root);
                             plan.files.entry(dep_path).or_default().push(fix);
@@ -778,22 +781,20 @@ fn plan_rename(
                 }
             }
         }
-    } else {
-        if let Some(file_line) = source.lines().nth((line as usize).saturating_sub(1)) {
-            for m in mappings {
-                if m.old == m.new {
-                    continue;
-                }
-                if file_line.contains(&m.old) {
-                    edits.push(TextEdit {
-                        line,
-                        old_text: m.old.clone(),
-                        new_text: m.new.clone(),
-                        rule_id: rule_id.to_string(),
-                        description: format!("Rename '{}' to '{}'", m.old, m.new),
-                        replace_all: false,
-                    });
-                }
+    } else if let Some(file_line) = source.lines().nth((line as usize).saturating_sub(1)) {
+        for m in mappings {
+            if m.old == m.new {
+                continue;
+            }
+            if file_line.contains(&m.old) {
+                edits.push(TextEdit {
+                    line,
+                    old_text: m.old.clone(),
+                    new_text: m.new.clone(),
+                    rule_id: rule_id.to_string(),
+                    description: format!("Rename '{}' to '{}'", m.old, m.new),
+                    replace_all: false,
+                });
             }
         }
     }

@@ -12,6 +12,7 @@ konveyor-core = "0.0.4"
 
 # Serialization (for incident variable inspection)
 serde_json = "1"
+serde_yaml = "0.9"
 
 # HTTP (sync) for npm registry queries
 ureq = { version = "3", features = ["json"] }

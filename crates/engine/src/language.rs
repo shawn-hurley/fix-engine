@@ -45,15 +45,17 @@ pub trait LanguageFixProvider: Send + Sync {
         file_path: &Path,
     ) -> Option<PlannedFix>;
 
-    /// Plan a dependency version fix.
+    /// Plan dependency version fix(es).
     ///
     /// Given an incident requiring a dependency to be at a specific version,
-    /// produce a [`PlannedFix`] with the text edits needed to update or add
-    /// the dependency in the appropriate manifest file (e.g., `package.json`
+    /// produce [`PlannedFix`] entries with the text edits needed to update or
+    /// add the dependency in the appropriate manifest file (e.g., `package.json`
     /// for Node.js, `Cargo.toml` for Rust, `go.mod` for Go).
     ///
-    /// Returns `None` if the language provider does not support dependency
-    /// management or if the incident cannot be processed.
+    /// Returns a `Vec` because a single incident (e.g., a transitive lockfile
+    /// dep) may require updating multiple parent packages. Returns an empty
+    /// `Vec` if the language provider does not support dependency management
+    /// or if the incident cannot be processed.
     fn plan_ensure_dependency(
         &self,
         rule_id: &str,
@@ -61,7 +63,7 @@ pub trait LanguageFixProvider: Send + Sync {
         package: &str,
         new_version: &str,
         file_path: &Path,
-    ) -> Option<PlannedFix>;
+    ) -> Vec<PlannedFix>;
 
     /// Extract the matched text from incident variables.
     ///
@@ -122,8 +124,8 @@ impl LanguageFixProvider for NoOpLanguageFixProvider {
         _package: &str,
         _new_version: &str,
         _file_path: &Path,
-    ) -> Option<PlannedFix> {
-        None
+    ) -> Vec<PlannedFix> {
+        Vec::new()
     }
 
     fn get_matched_text(&self, _incident: &Incident) -> String {
@@ -183,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_noop_provider_returns_none_for_ensure_dependency() {
+    fn test_noop_provider_returns_empty_for_ensure_dependency() {
         let provider = NoOpLanguageFixProvider;
         let incident = konveyor_core::incident::Incident {
             file_uri: "file:///test.rs".to_string(),
@@ -198,7 +200,7 @@ mod tests {
         };
         assert!(provider
             .plan_ensure_dependency("rule", &incident, "pkg", "1.0.0", Path::new("/test.rs"))
-            .is_none());
+            .is_empty());
     }
 
     #[test]
