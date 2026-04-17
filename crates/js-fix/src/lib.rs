@@ -122,10 +122,13 @@ impl LanguageFixProvider for JsFixProvider {
 /// enable it. We capture its output, parse the YN0002 warning lines to
 /// extract the names of missing peer packages, then run `yarn add` for them.
 fn run_yarn_install_and_resolve_peers(project_root: &Path) {
-    tracing::info!("Running yarn install --ignore-scripts");
+    tracing::info!("Running yarn install (scripts disabled)");
 
+    // Yarn berry (v2+) doesn't support --ignore-scripts; use the env var instead.
+    // Yarn classic (v1) supports both the flag and the env var.
     let output = std::process::Command::new("yarn")
-        .args(["install", "--ignore-scripts"])
+        .args(["install"])
+        .env("YARN_ENABLE_SCRIPTS", "false")
         .current_dir(project_root)
         .output();
 
@@ -160,7 +163,7 @@ fn run_yarn_install_and_resolve_peers(project_root: &Path) {
     let add_result = std::process::Command::new("yarn")
         .arg("add")
         .args(&missing_peers)
-        .arg("--ignore-scripts")
+        .env("YARN_ENABLE_SCRIPTS", "false")
         .current_dir(project_root)
         .output();
 
