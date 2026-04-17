@@ -91,6 +91,21 @@ pub trait LanguageFixProvider: Send + Sync {
     /// occurrences of the rename mappings.
     fn is_whole_file_rename(&self, incident: &Incident) -> bool;
 
+    /// Capture baseline state before edits are written to disk.
+    ///
+    /// Called once before any files are modified. Implementations can capture
+    /// pre-existing state needed for diffing in `post_apply` — e.g., the set
+    /// of unmet peer dependencies before package version updates, so that
+    /// `post_apply` only installs *newly* introduced peers rather than
+    /// pre-existing intentionally-unmet ones (like host-provided shared modules).
+    ///
+    /// Returns opaque state that will be forwarded to `post_apply`.
+    ///
+    /// Default: no-op, returns `None`.
+    fn pre_apply(&self, _project_root: &Path) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
     /// Post-process after all fixes in a plan have been applied to disk.
     ///
     /// Called once after all files are written. Implementations can trigger
@@ -99,12 +114,14 @@ pub trait LanguageFixProvider: Send + Sync {
     ///
     /// `project_root` is the top-level project directory.
     /// `modified_files` lists paths of files that were actually changed.
+    /// `pre_state` is the opaque state returned by `pre_apply`, if any.
     ///
     /// Default: no-op.
     fn post_apply(
         &self,
         _project_root: &Path,
         _modified_files: &[std::path::PathBuf],
+        _pre_state: Option<Box<dyn std::any::Any>>,
     ) -> anyhow::Result<()> {
         Ok(())
     }

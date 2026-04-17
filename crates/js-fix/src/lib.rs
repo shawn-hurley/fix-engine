@@ -84,10 +84,31 @@ impl LanguageFixProvider for JsFixProvider {
         incident.variables.contains_key("importedName")
     }
 
+    fn pre_apply(&self, project_root: &Path) -> Option<Box<dyn std::any::Any>> {
+        // For yarn projects, capture the baseline set of unmet peer dep names
+        // BEFORE any edits are written. This lets post_apply diff against the
+        // baseline and only install peers that are newly introduced by our
+        // version updates — not pre-existing intentionally-unmet ones (e.g.,
+        // host-provided shared modules like react-redux in console plugins).
+        if !project_root.join("yarn.lock").exists() {
+            return None;
+        }
+
+        tracing::info!("Capturing baseline peer dependency warnings before applying fixes");
+        let baseline = capture_yarn_missing_peer_names(project_root);
+        tracing::info!(
+            count = baseline.len(),
+            peers = ?baseline,
+            "Baseline unmet peer dependencies captured"
+        );
+        Some(Box::new(baseline))
+    }
+
     fn post_apply(
         &self,
         project_root: &Path,
         modified_files: &[std::path::PathBuf],
+        pre_state: Option<Box<dyn std::any::Any>>,
     ) -> anyhow::Result<()> {
         // Check if any package.json was modified — if so, run install to
         // regenerate the lockfile and node_modules.
@@ -102,7 +123,12 @@ impl LanguageFixProvider for JsFixProvider {
         tracing::info!("package.json was modified, running install to sync lockfile");
 
         if project_root.join("yarn.lock").exists() {
-            run_yarn_install_and_resolve_peers(project_root);
+            // Extract the baseline peer dep names captured by pre_apply
+            let baseline = pre_state
+                .and_then(|s| s.downcast::<std::collections::HashSet<String>>().ok())
+                .map(|b| *b)
+                .unwrap_or_default();
+            run_yarn_install_and_resolve_peers(project_root, &baseline);
         } else if project_root.join("pnpm-lock.yaml").exists() {
             run_pnpm_install(project_root);
         } else {
@@ -115,13 +141,51 @@ impl LanguageFixProvider for JsFixProvider {
 
 // ── Post-apply install helpers ──────────────────────────────────────────
 
+/// Run `yarn install` and return the set of missing peer dependency names
+/// from YN0002 warnings. Used to capture a baseline before edits are
+/// applied, so that post-apply can diff and only install newly-introduced peers.
+fn capture_yarn_missing_peer_names(project_root: &Path) -> std::collections::HashSet<String> {
+    let output = std::process::Command::new("yarn")
+        .args(["install"])
+        .env("YARN_ENABLE_SCRIPTS", "false")
+        .current_dir(project_root)
+        .output();
+
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            parse_yarn_missing_peer_deps(&stdout)
+                .into_iter()
+                .map(|p| p.peer_name)
+                .collect()
+        }
+        Err(e) => {
+            tracing::warn!(
+                "yarn install could not be executed for baseline capture: {}",
+                e
+            );
+            std::collections::HashSet::new()
+        }
+    }
+}
+
 /// Run `yarn install`, parse peer dependency warnings (YN0002), and install
-/// any missing peers automatically.
+/// any missing peers that are *newly* introduced by our edits.
+///
+/// `baseline_peers` is the set of peer dep names that were already unmet
+/// before any edits were applied. Only peers NOT in this baseline set are
+/// installed, preventing accidental installation of host-provided packages
+/// (like `react-redux` in OpenShift console plugins) or other pre-existing
+/// intentionally-unmet peers.
 ///
 /// Yarn berry does not auto-install peer dependencies and has no config to
 /// enable it. We capture its output, parse the YN0002 warning lines to
-/// extract the names of missing peer packages, then run `yarn add` for them.
-fn run_yarn_install_and_resolve_peers(project_root: &Path) {
+/// extract the names of missing peer packages, then run `yarn add -D` for
+/// the newly-introduced ones.
+fn run_yarn_install_and_resolve_peers(
+    project_root: &Path,
+    baseline_peers: &std::collections::HashSet<String>,
+) {
     tracing::info!("Running yarn install (scripts disabled)");
 
     // Yarn berry (v2+) doesn't support --ignore-scripts; use the env var instead.
@@ -147,12 +211,29 @@ fn run_yarn_install_and_resolve_peers(project_root: &Path) {
 
     // Yarn berry writes warnings to stdout. Parse YN0002 lines for missing peers.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let missing_peers = parse_yarn_missing_peer_deps(&stdout);
+    let all_missing_peers = parse_yarn_missing_peer_deps(&stdout);
+
+    // Filter to only peers that are NEW (not in the baseline). Pre-existing
+    // unmet peers are intentionally absent (e.g., host-provided shared modules
+    // like react-redux, redux, redux-thunk in OpenShift console plugins).
+    let missing_peers: Vec<_> = all_missing_peers
+        .into_iter()
+        .filter(|p| !baseline_peers.contains(&p.peer_name))
+        .collect();
 
     if missing_peers.is_empty() {
-        tracing::info!("yarn install completed, no missing peer dependencies");
+        tracing::info!("yarn install completed, no newly-introduced missing peer dependencies");
         return;
     }
+
+    tracing::info!(
+        new_count = missing_peers.len(),
+        baseline_count = baseline_peers.len(),
+        "Filtered peer deps: {} new (out of {} total warnings, {} were pre-existing)",
+        missing_peers.len(),
+        missing_peers.len() + baseline_peers.len(),
+        baseline_peers.len(),
+    );
 
     // Build version-qualified install specs by looking up each peer's
     // required version range from the requesting package's peerDependencies
@@ -196,8 +277,12 @@ fn run_yarn_install_and_resolve_peers(project_root: &Path) {
         "Installing missing peer dependencies with resolved versions"
     );
 
+    // Use -D (--dev) so peer deps land in devDependencies, not dependencies.
+    // These are transitive peer requirements from dev tooling packages
+    // (e.g., @patternfly/react-component-groups needs react-drag-drop),
+    // not production dependencies the consumer ships.
     let add_result = std::process::Command::new("yarn")
-        .arg("add")
+        .args(["add", "-D"])
         .args(&install_specs)
         .env("YARN_ENABLE_SCRIPTS", "false")
         .current_dir(project_root)
@@ -241,18 +326,37 @@ fn parse_yarn_missing_peer_deps(output: &str) -> Vec<MissingPeerDep> {
     let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex");
     let stripped = ansi_re.replace_all(output, "");
 
-    // Match YN0002 lines:
-    //   YN0002: <requester>@npm:<version> doesn't provide <peer_name> (<hash>), ...
+    // Match YN0002 lines. Two formats exist:
+    //   Package-level: YN0002: <pkg>@npm:<ver> doesn't provide <peer> (<hash>), requested by <requester>.
+    //   Workspace-level: YN0002: │ <workspace>@workspace:. doesn't provide <peer> (<hash>), requested by <requester>.
     // Both requester and peer name can be scoped (e.g., @scope/pkg).
-    let peer_re = regex::Regex::new(r"YN0002: (@?[^@\s]+)@\S+ doesn't provide (@?[^\s(]+) \(")
-        .expect("valid regex");
+    // Yarn 4.6.0 uses a "│ " (box-drawing vertical bar) separator after the
+    // warning code in some output formats (e.g., workspace peer dep warnings).
+    //
+    // For workspace-level warnings, the first name is the workspace (e.g.,
+    // "pipelines-console-plugin") which won't exist in node_modules. We also
+    // capture the "requested by" package at the end of the line (group 3) so
+    // `lookup_peer_dep_version` can find the actual package that declares the
+    // peer dependency.
+    let peer_re = regex::Regex::new(
+        r"YN0002: (?:│ )?(@?[^@\s]+)@\S+ doesn't provide (@?[^\s(]+) \([^)]+\),? ?(?:requested by (@?[^\s.]+))?",
+    )
+    .expect("valid regex");
 
     let mut seen = std::collections::HashSet::new();
     peer_re
         .captures_iter(&stripped)
         .filter_map(|cap| {
-            let requested_by = cap[1].to_string();
+            let provider = cap[1].to_string();
             let peer_name = cap[2].to_string();
+            // Prefer the "requested by" package (group 3) when available,
+            // since the provider field for workspace-level warnings is the
+            // workspace name (not in node_modules). For package-level warnings,
+            // the provider IS the requesting package, so fall back to it.
+            let requested_by = cap
+                .get(3)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or(provider);
             // Deduplicate by peer_name — use the first requester encountered
             seen.insert(peer_name.clone()).then_some(MissingPeerDep {
                 peer_name,
@@ -1611,9 +1715,11 @@ mod tests {
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].peer_name, "victory");
+        // "requested by" trailer matches the provider here
         assert_eq!(peers[0].requested_by, "@patternfly/react-charts");
         assert_eq!(peers[1].peer_name, "victory-core");
-        assert_eq!(peers[1].requested_by, "@patternfly/react-charts");
+        // "requested by" trailer names a different package than the provider
+        assert_eq!(peers[1].requested_by, "some-dep");
     }
 
     #[test]
@@ -1623,7 +1729,8 @@ mod tests {
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].peer_name, "bar");
-        assert_eq!(peers[0].requested_by, "foo");
+        // "requested by" trailer takes precedence over provider
+        assert_eq!(peers[0].requested_by, "baz");
     }
 
     #[test]
@@ -1632,7 +1739,8 @@ mod tests {
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].peer_name, "@scope/peer-pkg");
-        assert_eq!(peers[0].requested_by, "@scope/some-pkg");
+        // "requested by" trailer takes precedence
+        assert_eq!(peers[0].requested_by, "other-dep");
     }
 
     #[test]
@@ -1645,8 +1753,54 @@ mod tests {
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].peer_name, "victory");
-        // First requester wins for deduplication
-        assert_eq!(peers[0].requested_by, "pkg-a");
+        // First requester wins for deduplication; uses "requested by" trailer
+        assert_eq!(peers[0].requested_by, "dep-a");
+    }
+
+    #[test]
+    fn parse_yarn_missing_peers_workspace_box_separator() {
+        // Yarn 4.6.0 uses "│ " (box-drawing vertical bar) separator for
+        // workspace-level peer dep warnings. This is the actual format
+        // observed when a workspace doesn't provide a peer dep required
+        // by one of its dependencies. The "requested by" package at the
+        // end of each line should be used as requested_by (not the workspace name).
+        let output = "\
+➤ YN0000: · Yarn 4.6.0
+➤ YN0000: ┌ Resolution step
+➤ YN0000: └ Completed
+➤ YN0000: ┌ Post-resolution validation
+➤ YN0002: │ pipelines-console-plugin@workspace:. doesn't provide @patternfly/react-drag-drop (pccfa6), requested by @patternfly/react-component-groups.
+➤ YN0002: │ pipelines-console-plugin@workspace:. doesn't provide axe-core (p27d9e), requested by cypress-axe.
+➤ YN0002: │ pipelines-console-plugin@workspace:. doesn't provide i18next (p374d5), requested by react-i18next.
+➤ YN0086: │ Some peer dependencies are incorrectly met by your project; run yarn explain peer-requirements <hash> for details, where <hash> is the six-letter p-prefixed code.
+➤ YN0000: └ Completed
+➤ YN0000: · Done with warnings in 1s 4ms
+";
+        let peers = super::parse_yarn_missing_peer_deps(output);
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0].peer_name, "@patternfly/react-drag-drop");
+        assert_eq!(peers[0].requested_by, "@patternfly/react-component-groups");
+        assert_eq!(peers[1].peer_name, "axe-core");
+        assert_eq!(peers[1].requested_by, "cypress-axe");
+        assert_eq!(peers[2].peer_name, "i18next");
+        assert_eq!(peers[2].requested_by, "react-i18next");
+    }
+
+    #[test]
+    fn parse_yarn_missing_peers_mixed_formats() {
+        // Mix of workspace-level (with │) and package-level (without │) warnings.
+        // Workspace-level uses "requested by" for requested_by; package-level
+        // also uses "requested by" when available, falling back to the provider.
+        let output = "\
+➤ YN0002: │ my-app@workspace:. doesn't provide @patternfly/react-drag-drop (pccfa6), requested by @patternfly/react-component-groups.
+➤ YN0002: @patternfly/react-charts@npm:8.4.1 doesn't provide victory (p1a2b3), requested by @patternfly/react-charts.
+";
+        let peers = super::parse_yarn_missing_peer_deps(output);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].peer_name, "@patternfly/react-drag-drop");
+        assert_eq!(peers[0].requested_by, "@patternfly/react-component-groups");
+        assert_eq!(peers[1].peer_name, "victory");
+        assert_eq!(peers[1].requested_by, "@patternfly/react-charts");
     }
 
     #[test]
@@ -1759,5 +1913,87 @@ mod tests {
             "^6.30.3-pre-v6.0",
             "^6.0.0"
         ));
+    }
+
+    #[test]
+    fn range_compatible_higher_patch_not_downgraded() {
+        // Consumer has ^6.4.2, rule wants ^6.4.1. The consumer's range is
+        // already within the required range, so no update should occur.
+        // This prevents version specifier downgrades.
+        assert!(super::is_range_already_compatible("^6.4.2", "^6.4.1"));
+    }
+
+    #[test]
+    fn range_compatible_higher_minor_not_downgraded() {
+        // Consumer has ^6.5.0, rule wants ^6.4.1. Same principle.
+        assert!(super::is_range_already_compatible("^6.5.0", "^6.4.1"));
+    }
+
+    #[test]
+    fn baseline_diff_filters_preexisting_peers() {
+        // Simulate the before/after diff logic used in run_yarn_install_and_resolve_peers.
+        // Baseline (before fixes): these peers were already unmet
+        let baseline: std::collections::HashSet<String> = [
+            "@patternfly/react-styles",
+            "axe-core",
+            "i18next",
+            "mocha",
+            "react-redux",
+            "react-router",
+            "react-router-dom",
+            "redux",
+            "redux-thunk",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // After fixes: some are still unmet, plus one new one
+        let after_output = "\
+➤ YN0002: │ my-app@workspace:. doesn't provide @patternfly/react-drag-drop (pccfa6), requested by @patternfly/react-component-groups.
+➤ YN0002: │ my-app@workspace:. doesn't provide axe-core (p27d9e), requested by cypress-axe.
+➤ YN0002: │ my-app@workspace:. doesn't provide i18next (p374d5), requested by react-i18next.
+➤ YN0002: │ my-app@workspace:. doesn't provide mocha (p7ec1d), requested by cypress-multi-reporters and other dependencies.
+➤ YN0002: │ my-app@workspace:. doesn't provide react-redux (pa391f), requested by @openshift/dynamic-plugin-sdk-extensions and other dependencies.
+➤ YN0002: │ my-app@workspace:. doesn't provide react-router-dom (p7d47e), requested by react-router-dom-v5-compat.
+➤ YN0002: │ my-app@workspace:. doesn't provide redux (pd1d52), requested by @openshift/dynamic-plugin-sdk-extensions and other dependencies.
+➤ YN0002: │ my-app@workspace:. doesn't provide redux-thunk (pd9e06), requested by @openshift/dynamic-plugin-sdk-utils.
+";
+        let all_missing = super::parse_yarn_missing_peer_deps(after_output);
+
+        // Filter: only peers NOT in the baseline should remain
+        let new_peers: Vec<_> = all_missing
+            .into_iter()
+            .filter(|p| !baseline.contains(&p.peer_name))
+            .collect();
+
+        // Only @patternfly/react-drag-drop is new
+        assert_eq!(new_peers.len(), 1);
+        assert_eq!(new_peers[0].peer_name, "@patternfly/react-drag-drop");
+        assert_eq!(
+            new_peers[0].requested_by,
+            "@patternfly/react-component-groups"
+        );
+    }
+
+    #[test]
+    fn baseline_diff_installs_nothing_when_no_new_peers() {
+        // If no new peers are introduced, nothing should be installed
+        let baseline: std::collections::HashSet<String> = ["react-redux", "redux"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let after_output = "\
+➤ YN0002: │ my-app@workspace:. doesn't provide react-redux (pa391f), requested by some-pkg.
+➤ YN0002: │ my-app@workspace:. doesn't provide redux (pd1d52), requested by some-pkg.
+";
+        let all_missing = super::parse_yarn_missing_peer_deps(after_output);
+        let new_peers: Vec<_> = all_missing
+            .into_iter()
+            .filter(|p| !baseline.contains(&p.peer_name))
+            .collect();
+
+        assert!(new_peers.is_empty());
     }
 }

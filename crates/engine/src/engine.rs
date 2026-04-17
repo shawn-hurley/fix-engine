@@ -693,6 +693,9 @@ pub fn apply_fixes(
     lang: &dyn LanguageFixProvider,
     project_root: &Path,
 ) -> Result<FixResult> {
+    // Capture baseline state before any edits (e.g., pre-existing unmet peer deps)
+    let pre_state = lang.pre_apply(project_root);
+
     let mut result = FixResult {
         edits_subsumed: plan.edits_subsumed,
         ..FixResult::default()
@@ -772,7 +775,7 @@ pub fn apply_fixes(
     }
 
     // Run post-apply hook (e.g., npm install after package.json changes)
-    if let Err(e) = lang.post_apply(project_root, &result.modified_files) {
+    if let Err(e) = lang.post_apply(project_root, &result.modified_files, pre_state) {
         tracing::warn!("Post-apply hook failed: {}", e);
         result.errors.push(format!("Post-apply hook failed: {}", e));
     }
