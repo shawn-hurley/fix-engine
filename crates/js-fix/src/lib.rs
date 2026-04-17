@@ -1018,8 +1018,13 @@ fn plan_ensure_npm_dependency_inner(
     let mut last_entry_line: Option<usize> = None;
     let mut closing_brace_line: Option<usize> = None;
 
-    for idx in target_block.start..target_block.end {
-        let trimmed = lines[idx].trim();
+    for (idx, line) in lines
+        .iter()
+        .enumerate()
+        .take(target_block.end)
+        .skip(target_block.start)
+    {
+        let trimmed = line.trim();
         if trimmed == "}" || trimmed == "}," {
             closing_brace_line = Some(idx);
             break;

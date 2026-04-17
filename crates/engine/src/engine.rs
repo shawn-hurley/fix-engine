@@ -219,7 +219,7 @@ pub fn plan_fixes(
 
     // Sort edits within each file by line number (descending) so we can apply bottom-up
     for fixes in plan.files.values_mut() {
-        fixes.sort_by(|a, b| b.line.cmp(&a.line));
+        fixes.sort_by_key(|f| std::cmp::Reverse(f.line));
     }
 
     // Deduplicate overlapping edits: when multiple edits target the same line
@@ -885,7 +885,7 @@ fn plan_rename(
     if is_whole_file_rename {
         let mut sorted_mappings: Vec<&RenameMapping> =
             mappings.iter().filter(|m| m.old != m.new).collect();
-        sorted_mappings.sort_by(|a, b| b.old.len().cmp(&a.old.len()));
+        sorted_mappings.sort_by_key(|m| std::cmp::Reverse(m.old.len()));
 
         for (idx, file_line) in source.lines().enumerate() {
             let line_num = (idx + 1) as u32;
