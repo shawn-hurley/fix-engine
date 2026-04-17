@@ -207,7 +207,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
     // Phase 1b: Apply pattern-based fixes first (so LLM sees already-renamed code)
     if opts.apply && !plan.files.is_empty() {
         eprintln!("\nApplying pattern-based fixes...");
-        let result = engine::apply_fixes(&plan, &lang)?;
+        let result = engine::apply_fixes(&plan, &lang, &project)?;
         eprintln!("  Files modified: {}", result.files_modified);
         eprintln!("  Edits applied:  {}", result.edits_applied);
         eprintln!("  Edits subsumed: {}", result.edits_subsumed);
@@ -351,7 +351,7 @@ pub async fn run(opts: FixOpts) -> Result<()> {
                     eprintln!("  LLM generated {} fixes, {} errors", llm_fixes, llm_errors);
 
                     if opts.apply && !plan.files.is_empty() {
-                        let result = engine::apply_fixes(&plan, &lang)?;
+                        let result = engine::apply_fixes(&plan, &lang, &project)?;
                         eprintln!("  Applied {} LLM edits", result.edits_applied);
                     }
                 }

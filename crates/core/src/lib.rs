@@ -118,6 +118,8 @@ pub struct FixResult {
     pub edits_subsumed: usize,
     /// Errors encountered.
     pub errors: Vec<String>,
+    /// Paths of files that were actually modified on disk.
+    pub modified_files: Vec<std::path::PathBuf>,
 }
 
 /// A rename mapping: old name -> new name.

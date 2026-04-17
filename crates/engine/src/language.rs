@@ -90,6 +90,24 @@ pub trait LanguageFixProvider: Send + Sync {
     /// When this returns `true`, the engine scans the entire file for all
     /// occurrences of the rename mappings.
     fn is_whole_file_rename(&self, incident: &Incident) -> bool;
+
+    /// Post-process after all fixes in a plan have been applied to disk.
+    ///
+    /// Called once after all files are written. Implementations can trigger
+    /// ecosystem-specific steps like `npm install` after `package.json`
+    /// modifications to keep the lockfile and `node_modules` in sync.
+    ///
+    /// `project_root` is the top-level project directory.
+    /// `modified_files` lists paths of files that were actually changed.
+    ///
+    /// Default: no-op.
+    fn post_apply(
+        &self,
+        _project_root: &Path,
+        _modified_files: &[std::path::PathBuf],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// No-op fallback provider for languages without specific fix support.

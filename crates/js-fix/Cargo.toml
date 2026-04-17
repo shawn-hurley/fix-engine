@@ -17,6 +17,9 @@ serde_yaml = "0.9"
 # HTTP (sync) for npm registry queries
 ureq = { version = "3", features = ["json"] }
 
+# Error handling
+anyhow = "1"
+
 # Logging
 tracing = "0.1"
 

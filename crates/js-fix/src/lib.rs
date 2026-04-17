@@ -83,6 +83,179 @@ impl LanguageFixProvider for JsFixProvider {
         // lines beyond the import: opening tags, closing tags, type references.
         incident.variables.contains_key("importedName")
     }
+
+    fn post_apply(
+        &self,
+        project_root: &Path,
+        modified_files: &[std::path::PathBuf],
+    ) -> anyhow::Result<()> {
+        // Check if any package.json was modified — if so, run install to
+        // regenerate the lockfile and node_modules.
+        let any_package_json = modified_files
+            .iter()
+            .any(|p| p.file_name().and_then(|f| f.to_str()) == Some("package.json"));
+
+        if !any_package_json {
+            return Ok(());
+        }
+
+        tracing::info!("package.json was modified, running install to sync lockfile");
+
+        if project_root.join("yarn.lock").exists() {
+            run_yarn_install_and_resolve_peers(project_root);
+        } else if project_root.join("pnpm-lock.yaml").exists() {
+            run_pnpm_install(project_root);
+        } else {
+            run_npm_install(project_root);
+        }
+
+        Ok(())
+    }
+}
+
+// ── Post-apply install helpers ──────────────────────────────────────────
+
+/// Run `yarn install`, parse peer dependency warnings (YN0002), and install
+/// any missing peers automatically.
+///
+/// Yarn berry does not auto-install peer dependencies and has no config to
+/// enable it. We capture its output, parse the YN0002 warning lines to
+/// extract the names of missing peer packages, then run `yarn add` for them.
+fn run_yarn_install_and_resolve_peers(project_root: &Path) {
+    tracing::info!("Running yarn install --ignore-scripts");
+
+    let output = std::process::Command::new("yarn")
+        .args(["install", "--ignore-scripts"])
+        .current_dir(project_root)
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("yarn install could not be executed: {}", e);
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!("yarn install failed: {}", stderr.trim());
+    }
+
+    // Yarn berry writes warnings to stdout. Parse YN0002 lines for missing peers.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let missing_peers = parse_yarn_missing_peer_deps(&stdout);
+
+    if missing_peers.is_empty() {
+        tracing::info!("yarn install completed, no missing peer dependencies");
+        return;
+    }
+
+    tracing::info!(
+        count = missing_peers.len(),
+        peers = ?missing_peers,
+        "Installing missing peer dependencies detected from yarn warnings"
+    );
+
+    let add_result = std::process::Command::new("yarn")
+        .arg("add")
+        .args(&missing_peers)
+        .arg("--ignore-scripts")
+        .current_dir(project_root)
+        .output();
+
+    match add_result {
+        Ok(o) if o.status.success() => {
+            tracing::info!("Successfully installed missing peer dependencies");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!("yarn add for peer dependencies failed: {}", stderr.trim());
+        }
+        Err(e) => {
+            tracing::warn!("yarn add could not be executed: {}", e);
+        }
+    }
+}
+
+/// Parse yarn berry output for YN0002 (missing peer dependency) warnings.
+///
+/// Yarn berry emits lines like:
+/// ```text
+/// ➤ YN0002: @patternfly/react-charts@npm:8.4.1 doesn't provide victory (p1a2b3), requested by ...
+/// ```
+///
+/// The output contains ANSI escape codes which are stripped before matching.
+/// Returns a deduplicated list of missing peer package names.
+fn parse_yarn_missing_peer_deps(output: &str) -> Vec<String> {
+    // Strip ANSI escape codes: ESC[ followed by parameters and a letter
+    let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex");
+    let stripped = ansi_re.replace_all(output, "");
+
+    // Match YN0002 lines:
+    //   YN0002: <locator> doesn't provide <peer_name> (<hash>), requested by ...
+    // The peer name can be scoped (e.g., @scope/pkg) or unscoped.
+    let peer_re =
+        regex::Regex::new(r"YN0002: .+ doesn't provide (@?[^\s(]+) \(").expect("valid regex");
+
+    let mut seen = std::collections::HashSet::new();
+    peer_re
+        .captures_iter(&stripped)
+        .filter_map(|cap| {
+            let name = cap[1].to_string();
+            seen.insert(name.clone()).then_some(name)
+        })
+        .collect()
+}
+
+/// Run `pnpm install` with auto-install-peers enabled via env var.
+///
+/// pnpm supports `auto-install-peers` (default true since v8) but we set
+/// the env var explicitly to ensure it works on older pnpm versions too.
+fn run_pnpm_install(project_root: &Path) {
+    tracing::info!("Running pnpm install --ignore-scripts (with auto-install-peers)");
+
+    let output = std::process::Command::new("pnpm")
+        .args(["install", "--ignore-scripts"])
+        .env("npm_config_auto_install_peers", "true")
+        .current_dir(project_root)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::info!("pnpm install completed successfully");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!("pnpm install failed: {}", stderr.trim());
+        }
+        Err(e) => {
+            tracing::warn!("pnpm install could not be executed: {}", e);
+        }
+    }
+}
+
+/// Run `npm install`. npm v7+ auto-installs peer dependencies by default.
+fn run_npm_install(project_root: &Path) {
+    tracing::info!("Running npm install --ignore-scripts --no-audit --no-fund");
+
+    let output = std::process::Command::new("npm")
+        .args(["install", "--ignore-scripts", "--no-audit", "--no-fund"])
+        .current_dir(project_root)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            tracing::info!("npm install completed successfully");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing::warn!("npm install failed: {}", stderr.trim());
+        }
+        Err(e) => {
+            tracing::warn!("npm install could not be executed: {}", e);
+        }
+    }
 }
 
 // -- JSX prop removal --
@@ -545,12 +718,26 @@ fn plan_ensure_npm_dependency_inner(
     let source = std::fs::read_to_string(&pkg_json).ok()?;
     let pkg_json_uri = format!("file://{}", pkg_json.display());
 
-    // --- Try update: find the package name and replace its version ---
+    // --- Identify top-level dependency blocks ---
+    // We need to distinguish top-level "dependencies" / "devDependencies" from
+    // nested ones (e.g., "consolePlugin.dependencies"). Top-level blocks start
+    // at JSON brace depth 1 (inside the root object).
+    let lines: Vec<&str> = source.lines().collect();
+    let top_level_dep_ranges = find_top_level_dep_blocks(&lines);
+
+    // --- Try update: find the package in a top-level dep block and replace its version ---
     let package_quoted = format!("\"{}\"", package);
-    let version_re = regex::Regex::new(r#"("[\^~><=]*\d+\.\d+\.\d+[^"]*")"#).ok()?;
+    let version_re = regex::Regex::new(r#"("[\^~><=]*[0-9][^"]*")"#).ok()?;
 
     for (idx, file_line) in source.lines().enumerate() {
         if !file_line.contains(&package_quoted) {
+            continue;
+        }
+        // Only match if this line is inside a top-level dep block
+        if !top_level_dep_ranges
+            .iter()
+            .any(|r| idx >= r.start && idx < r.end)
+        {
             continue;
         }
         if let Some(m) = version_re.find(file_line) {
@@ -580,54 +767,34 @@ fn plan_ensure_npm_dependency_inner(
         }
     }
 
-    // --- Insert: package not found, add it to the "dependencies" block ---
-    let lines: Vec<&str> = source.lines().collect();
-    let mut in_dependencies = false;
-    let mut brace_depth = 0;
+    // --- Insert: package not found, add it to a top-level dep block ---
+    // Prefer "devDependencies" if it exists (most PF consumer deps live there),
+    // fall back to "dependencies".
+    let target_block = top_level_dep_ranges
+        .iter()
+        .find(|r| r.name == "devDependencies")
+        .or_else(|| {
+            top_level_dep_ranges
+                .iter()
+                .find(|r| r.name == "dependencies")
+        });
+
+    let target_block = target_block?;
     let mut last_entry_line: Option<usize> = None;
     let mut closing_brace_line: Option<usize> = None;
 
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-
-        if !in_dependencies {
-            if trimmed.starts_with("\"dependencies\"") {
-                in_dependencies = true;
-                if trimmed.contains('{') {
-                    brace_depth = 1;
-                }
-            }
-            continue;
-        }
-
-        if brace_depth == 0 && trimmed.starts_with('{') {
-            brace_depth = 1;
-            continue;
-        }
-
-        if brace_depth == 1 {
-            if trimmed == "}" || trimmed == "}," {
-                closing_brace_line = Some(idx);
-                break;
-            }
-            if !trimmed.is_empty() {
-                last_entry_line = Some(idx);
-            }
-        }
-
-        for ch in trimmed.chars() {
-            if ch == '{' {
-                brace_depth += 1;
-            } else if ch == '}' {
-                brace_depth -= 1;
-                if brace_depth == 0 {
-                    closing_brace_line = Some(idx);
-                    break;
-                }
-            }
-        }
-        if closing_brace_line.is_some() {
+    for idx in target_block.start..target_block.end {
+        let trimmed = lines[idx].trim();
+        if trimmed == "}" || trimmed == "}," {
+            closing_brace_line = Some(idx);
             break;
+        }
+        if !trimmed.is_empty()
+            && !trimmed.starts_with("\"dependencies\"")
+            && !trimmed.starts_with("\"devDependencies\"")
+            && trimmed != "{"
+        {
+            last_entry_line = Some(idx);
         }
     }
 
@@ -683,6 +850,99 @@ fn plan_ensure_npm_dependency_inner(
         line: closing_line_num,
         description: format!("Add {} {} to dependencies", package, new_version),
     })
+}
+
+// -- Top-level dependency block detection --
+
+/// A range of lines in package.json belonging to a top-level dependency block.
+struct DepBlockRange {
+    /// "dependencies" or "devDependencies"
+    name: &'static str,
+    /// Start line index (inclusive, the key line)
+    start: usize,
+    /// End line index (exclusive, after the closing brace)
+    end: usize,
+}
+
+/// Find top-level "dependencies" and "devDependencies" blocks in package.json.
+///
+/// Top-level means at JSON depth 1 (direct children of the root object).
+/// Nested blocks like "consolePlugin.dependencies" are at depth >= 2 and
+/// are excluded.
+fn find_top_level_dep_blocks(lines: &[&str]) -> Vec<DepBlockRange> {
+    let mut results = Vec::new();
+    let mut root_depth: i32 = 0;
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+
+        // Track root-level brace depth (outside any dep block scan)
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => root_depth += 1,
+                '}' => root_depth -= 1,
+                _ => {}
+            }
+        }
+
+        // Only match dep block keys at depth 1 (just entered the root object)
+        // After processing braces above, a line like `"dependencies": {` will
+        // have bumped root_depth to 2. So we check for depth == 2 for a
+        // combined key+brace line, or depth == 1 for key-only lines.
+        let is_dep_key = (root_depth == 2 || root_depth == 1)
+            && (trimmed.starts_with("\"dependencies\"")
+                || trimmed.starts_with("\"devDependencies\""));
+
+        if !is_dep_key {
+            i += 1;
+            continue;
+        }
+
+        let name = if trimmed.starts_with("\"devDependencies\"") {
+            "devDependencies"
+        } else {
+            "dependencies"
+        };
+
+        let start = i;
+        // Find the matching closing brace for this block
+        let mut block_depth: i32 = 0;
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => block_depth += 1,
+                '}' => block_depth -= 1,
+                _ => {}
+            }
+        }
+
+        i += 1;
+        while i < lines.len() && block_depth > 0 {
+            let t = lines[i].trim();
+            for ch in t.chars() {
+                match ch {
+                    '{' => {
+                        block_depth += 1;
+                        root_depth += 1;
+                    }
+                    '}' => {
+                        block_depth -= 1;
+                        root_depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+
+        results.push(DepBlockRange {
+            name,
+            start,
+            end: i,
+        });
+    }
+
+    results
 }
 
 // -- npm registry resolution --
@@ -1143,5 +1403,53 @@ mod tests {
         assert_eq!(fix.edits.len(), 1);
         assert!(fix.edits[0].new_text.contains("6.4.1"));
         assert!(fix.description.contains("react-core"));
+    }
+
+    #[test]
+    fn parse_yarn_missing_peers_basic() {
+        let output = "\
+➤ YN0000: · Yarn 4.6.0
+➤ YN0002: @patternfly/react-charts@npm:8.4.1 doesn't provide victory (p1a2b3), requested by @patternfly/react-charts.
+➤ YN0002: @patternfly/react-charts@npm:8.4.1 doesn't provide victory-core (p4d5e6), requested by some-dep.
+➤ YN0000: · Done in 1.5s
+";
+        let peers = super::parse_yarn_missing_peer_deps(output);
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&"victory".to_string()));
+        assert!(peers.contains(&"victory-core".to_string()));
+    }
+
+    #[test]
+    fn parse_yarn_missing_peers_with_ansi() {
+        // Simulate ANSI color codes wrapping the warning code
+        let output = "\x1b[33m➤\x1b[0m \x1b[33mYN0002\x1b[0m: \x1b[38;5;173mfoo@npm:1.0.0\x1b[0m doesn't provide \x1b[38;5;111mbar\x1b[0m (p7g8h9), requested by baz.\n";
+        let peers = super::parse_yarn_missing_peer_deps(output);
+        assert_eq!(peers, vec!["bar"]);
+    }
+
+    #[test]
+    fn parse_yarn_missing_peers_scoped_package() {
+        let output = "➤ YN0002: some-pkg@npm:2.0.0 doesn't provide @scope/peer-pkg (pabcde), requested by other-dep.\n";
+        let peers = super::parse_yarn_missing_peer_deps(output);
+        assert_eq!(peers, vec!["@scope/peer-pkg"]);
+    }
+
+    #[test]
+    fn parse_yarn_missing_peers_deduplicates() {
+        let output = "\
+➤ YN0002: pkg-a@npm:1.0.0 doesn't provide victory (p11111), requested by dep-a.
+➤ YN0002: pkg-b@npm:2.0.0 doesn't provide victory (p22222), requested by dep-b.
+➤ YN0002: pkg-c@npm:3.0.0 doesn't provide victory (p33333), requested by dep-c.
+";
+        let peers = super::parse_yarn_missing_peer_deps(output);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0], "victory");
+    }
+
+    #[test]
+    fn parse_yarn_missing_peers_no_warnings() {
+        let output = "➤ YN0000: · Yarn 4.6.0\n➤ YN0000: · Done in 0.5s\n";
+        let peers = super::parse_yarn_missing_peer_deps(output);
+        assert!(peers.is_empty());
     }
 }

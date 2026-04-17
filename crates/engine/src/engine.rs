@@ -14,7 +14,7 @@ use fix_engine_core::*;
 use konveyor_core::incident::Incident;
 use konveyor_core::report::RuleSet;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::language::LanguageFixProvider;
 
@@ -170,6 +170,13 @@ pub fn plan_fixes(
         }
     }
 
+    // Merge dependency-insert edits: when multiple EnsureDependency fixes
+    // insert new packages before the same closing brace line in package.json,
+    // combine them into a single multi-line insertion. Without this, only the
+    // first insert succeeds — subsequent ones fail because the closing brace
+    // line has already been replaced.
+    merge_dependency_inserts(&mut plan);
+
     // Sort edits within each file by line number (descending) so we can apply bottom-up
     for fixes in plan.files.values_mut() {
         fixes.sort_by(|a, b| b.line.cmp(&a.line));
@@ -193,6 +200,103 @@ pub fn plan_fixes(
 /// removed from the plan and counted in `plan.edits_subsumed`.
 ///
 /// When two edits share the same `old_text` but have different `new_text`
+/// Merge dependency-insert edits that target the same closing brace line.
+///
+/// When multiple `EnsureDependency` fixes each insert a new package before the
+/// closing `}` of a dep block in package.json, they all produce edits with the
+/// same `old_text` (the closing brace line) on the same line number. Only the
+/// first would succeed since the closing brace is replaced. This function
+/// combines them into a single edit that inserts all packages at once.
+fn merge_dependency_inserts(plan: &mut FixPlan) {
+    for (file_path, fixes) in plan.files.iter_mut() {
+        // Only process package.json files
+        if file_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .filter(|f| *f == "package.json")
+            .is_none()
+        {
+            continue;
+        }
+
+        // Find insert edits: description starts with "Add " and targets a
+        // closing brace line. Group by (line, old_text).
+        let mut insert_groups: std::collections::HashMap<(u32, String), Vec<(usize, usize)>> =
+            std::collections::HashMap::new();
+
+        for (fix_idx, fix) in fixes.iter().enumerate() {
+            for (edit_idx, edit) in fix.edits.iter().enumerate() {
+                if edit.description.starts_with("Add ")
+                    && edit.old_text.trim().starts_with('}')
+                    && edit.new_text.contains(&edit.old_text.trim().to_string())
+                {
+                    insert_groups
+                        .entry((edit.line, edit.old_text.clone()))
+                        .or_default()
+                        .push((fix_idx, edit_idx));
+                }
+            }
+        }
+
+        // For each group with >1 insert, merge into the first edit
+        for ((_line, old_text), indices) in &insert_groups {
+            if indices.len() <= 1 {
+                continue;
+            }
+
+            // Collect the new dependency lines from each edit.
+            // Each edit's new_text is like: `    "pkg": "ver"\n  }`
+            // We extract everything before the closing brace.
+            let closing_trimmed = old_text.trim().to_string();
+            let mut new_entries: Vec<String> = Vec::new();
+
+            for &(fix_idx, edit_idx) in indices {
+                let new_text = &fixes[fix_idx].edits[edit_idx].new_text;
+                // Extract lines before the closing brace
+                if let Some(pos) = new_text.rfind(&closing_trimmed) {
+                    let entries_part = &new_text[..pos];
+                    for entry_line in entries_part.lines() {
+                        let trimmed = entry_line.trim();
+                        if !trimmed.is_empty() {
+                            new_entries.push(entry_line.to_string());
+                        }
+                    }
+                }
+            }
+
+            if new_entries.is_empty() {
+                continue;
+            }
+
+            // Deduplicate entries (same package might appear from multiple rules)
+            let mut seen = std::collections::HashSet::new();
+            new_entries.retain(|e| seen.insert(e.clone()));
+
+            // Build the merged new_text: all entries followed by the closing brace
+            let merged_new_text = format!("{}\n{}", new_entries.join(",\n"), old_text.trim());
+
+            // Update the first edit with the merged text
+            let (first_fix, first_edit) = indices[0];
+            fixes[first_fix].edits[first_edit].new_text = merged_new_text;
+            fixes[first_fix].edits[first_edit].description =
+                format!("Add {} dependencies to package.json", new_entries.len());
+
+            // Remove the other edits by clearing them (they'll be deduped/skipped later)
+            for &(fix_idx, edit_idx) in &indices[1..] {
+                // Mark as no-op: set old_text to something that won't match
+                fixes[fix_idx].edits[edit_idx].old_text =
+                    "__MERGED_DEPENDENCY_INSERT__".to_string();
+            }
+
+            tracing::info!(
+                file = %file_path.display(),
+                count = new_entries.len(),
+                "Merged dependency insert edits into single edit"
+            );
+        }
+    }
+}
+
 /// (conflicting edits), the first in specificity order is kept.
 ///
 /// Exact duplicates (same line, old_text, new_text) are also removed.
@@ -541,7 +645,13 @@ pub fn consolidate_family_requests(
 /// Apply a fix plan to disk.
 ///
 /// `lang` provides language-specific post-processing (e.g., import deduplication).
-pub fn apply_fixes(plan: &FixPlan, lang: &dyn LanguageFixProvider) -> Result<FixResult> {
+/// After all files are written, calls `lang.post_apply()` for ecosystem-specific
+/// steps (e.g., `npm install` after `package.json` changes).
+pub fn apply_fixes(
+    plan: &FixPlan,
+    lang: &dyn LanguageFixProvider,
+    project_root: &Path,
+) -> Result<FixResult> {
     let mut result = FixResult {
         edits_subsumed: plan.edits_subsumed,
         ..FixResult::default()
@@ -616,7 +726,14 @@ pub fn apply_fixes(plan: &FixPlan, lang: &dyn LanguageFixProvider) -> Result<Fix
             }
             std::fs::write(file_path, output)?;
             result.files_modified += 1;
+            result.modified_files.push(file_path.clone());
         }
+    }
+
+    // Run post-apply hook (e.g., npm install after package.json changes)
+    if let Err(e) = lang.post_apply(project_root, &result.modified_files) {
+        tracing::warn!("Post-apply hook failed: {}", e);
+        result.errors.push(format!("Post-apply hook failed: {}", e));
     }
 
     Ok(result)
