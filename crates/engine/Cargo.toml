@@ -17,7 +17,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # HTTP client (for LLM endpoint)
-reqwest = { version = "0.12", features = ["json"] }
+# Uses rustls instead of native-tls (OpenSSL) to enable cross-compilation
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Utilities
 regex = "1"
