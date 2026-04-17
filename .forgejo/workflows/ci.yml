@@ -19,12 +19,6 @@ jobs:
       - name: Checkout
         uses: https://github.com/actions/checkout@v6
 
-      - name: Checkout konveyor-core (dependency)
-        uses: https://github.com/actions/checkout@v6
-        with:
-          repository: shawn_hurley/konveyor-core
-          path: ../konveyor-core
-
       - name: Install Rust stable
         uses: https://github.com/dtolnay/rust-toolchain@stable
         with:
