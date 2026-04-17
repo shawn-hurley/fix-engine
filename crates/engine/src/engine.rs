@@ -273,7 +273,8 @@ fn merge_dependency_inserts(plan: &mut FixPlan) {
             new_entries.retain(|e| seen.insert(e.clone()));
 
             // Build the merged new_text: all entries followed by the closing brace
-            let merged_new_text = format!("{}\n{}", new_entries.join(",\n"), old_text.trim());
+            // Preserve the original indentation of the closing brace line.
+            let merged_new_text = format!("{}\n{}", new_entries.join(",\n"), old_text);
 
             // Update the first edit with the merged text
             let (first_fix, first_edit) = indices[0];

@@ -581,6 +581,26 @@ fn plan_ensure_npm_dependency(
             }
         };
 
+        // Before resolving parents, check if the consumer's existing version
+        // of the target package already satisfies the required range. If so,
+        // there's nothing to do — the lockfile will sort itself out once the
+        // direct deps are updated by their own (non-lockfile) incidents.
+        //
+        // This prevents spurious updates like bumping react-dom from ^17 to ^19
+        // when the consumer has react@^17.0.1 and PF's peer dep is
+        // "^17 || ^18 || ^19" (which ^17.0.1 already satisfies).
+        if let Some(current_version) = read_dep_version_from_package_json(&pkg_json, package) {
+            if is_range_already_compatible(&current_version, new_version) {
+                tracing::info!(
+                    package = %package,
+                    current = %current_version,
+                    required = %new_version,
+                    "Lockfile path: consumer's version already satisfies required range; skipping parent resolution"
+                );
+                return Vec::new();
+            }
+        }
+
         // Get the set of direct dep names from package.json
         let direct_deps = lockfile::parse_direct_dep_names(&pkg_json);
 
@@ -661,6 +681,20 @@ fn plan_ensure_npm_dependency(
             Some(p) => p,
             None => return Vec::new(),
         };
+
+        // If the consumer already has a compatible version of the dependency
+        // that this package depends on, skip the transitive update.
+        if let Some(current) = read_dep_version_from_package_json(file_path, depends_on) {
+            if is_range_already_compatible(&current, new_version) {
+                tracing::info!(
+                    package = %depends_on,
+                    current = %current,
+                    required = %new_version,
+                    "Dependent path: consumer's version already satisfies required range; skipping"
+                );
+                return Vec::new();
+            }
+        }
 
         let target_major = extract_major(new_version);
 
@@ -743,6 +777,25 @@ fn plan_ensure_npm_dependency_inner(
         if let Some(m) = version_re.find(file_line) {
             let line = (idx + 1) as u32;
             let old_version = m.as_str();
+
+            // Strip quotes to get raw version strings for comparison
+            let old_ver_raw = old_version.trim_matches('"');
+
+            // If the consumer's existing version range is already compatible
+            // with the new required range, skip the update. This prevents
+            // unnecessary version churn — e.g., when PF expands its react
+            // peer dep from "^17 || ^18" to "^17 || ^18 || ^19", a consumer
+            // with "^17.0.1" doesn't need to change anything.
+            if is_range_already_compatible(old_ver_raw, new_version) {
+                tracing::info!(
+                    package = %package,
+                    current = %old_ver_raw,
+                    required = %new_version,
+                    "Skipping update: consumer's version range already satisfies the required range"
+                );
+                return None;
+            }
+
             let new_ver_quoted = format!("\"{}\"", new_version);
 
             return Some(PlannedFix {
@@ -943,6 +996,70 @@ fn find_top_level_dep_blocks(lines: &[&str]) -> Vec<DepBlockRange> {
     }
 
     results
+}
+
+// -- package.json version lookup --
+
+/// Read the version of a specific dependency from package.json.
+///
+/// Searches both `dependencies` and `devDependencies` (top-level only).
+/// Returns the raw version string (e.g., `"^17.0.1"`) if found.
+fn read_dep_version_from_package_json(pkg_json: &Path, package: &str) -> Option<String> {
+    let pkg_json = if pkg_json.file_name().is_some_and(|f| f == "package.json") {
+        pkg_json.to_path_buf()
+    } else {
+        find_nearest_package_json(pkg_json)?
+    };
+
+    let source = std::fs::read_to_string(&pkg_json).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&source).ok()?;
+
+    // Check both dependency sections
+    for section in ["dependencies", "devDependencies"] {
+        if let Some(version) = parsed
+            .get(section)
+            .and_then(|deps| deps.get(package))
+            .and_then(|v| v.as_str())
+        {
+            return Some(version.to_string());
+        }
+    }
+
+    None
+}
+
+// -- npm semver range compatibility --
+
+/// Check if the consumer's existing version range is already compatible with
+/// the required range from a peer dependency or dependency update rule.
+///
+/// Returns `true` if every version matched by `consumer_range` is also
+/// accepted by `required_range` — meaning the consumer doesn't need to
+/// change their version.
+///
+/// Examples:
+///   - `is_range_already_compatible("^17.0.1", "^17 || ^18 || ^19")` → true
+///     (^17.0.1 is a subset of ^17)
+///   - `is_range_already_compatible("^11.7.3", "^17.0.3")` → false
+///     (^11 and ^17 don't overlap)
+///   - `is_range_already_compatible("^6.4.1", "^6.4.1")` → true
+///     (identical ranges)
+///
+/// If either range fails to parse (e.g., dist tags like "latest", git URLs),
+/// returns `false` to allow the update to proceed.
+fn is_range_already_compatible(consumer_range: &str, required_range: &str) -> bool {
+    let consumer = match consumer_range.parse::<node_semver::Range>() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let required = match required_range.parse::<node_semver::Range>() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    // "Does the required range accept every version that the consumer's range accepts?"
+    // If yes, the consumer's current version is already within the acceptable set.
+    required.allows_all(&consumer)
 }
 
 // -- npm registry resolution --
@@ -1451,5 +1568,70 @@ mod tests {
         let output = "➤ YN0000: · Yarn 4.6.0\n➤ YN0000: · Done in 0.5s\n";
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert!(peers.is_empty());
+    }
+
+    // ── semver range compatibility tests ──
+
+    #[test]
+    fn range_compatible_caret_subset_of_or_range() {
+        // ^17.0.1 is a subset of ^17 || ^18 || ^19
+        assert!(super::is_range_already_compatible(
+            "^17.0.1",
+            "^17 || ^18 || ^19"
+        ));
+    }
+
+    #[test]
+    fn range_compatible_identical_ranges() {
+        assert!(super::is_range_already_compatible("^6.4.1", "^6.4.1"));
+    }
+
+    #[test]
+    fn range_incompatible_different_majors() {
+        // ^11.7.3 does NOT satisfy ^17.0.3
+        assert!(!super::is_range_already_compatible("^11.7.3", "^17.0.3"));
+    }
+
+    #[test]
+    fn range_compatible_exact_within_caret() {
+        // 1.2.3 is within ^1.0.0
+        assert!(super::is_range_already_compatible("1.2.3", "^1.0.0"));
+    }
+
+    #[test]
+    fn range_compatible_tilde_within_caret() {
+        // ~1.2.3 (>=1.2.3 <1.3.0) is within ^1.0.0 (>=1.0.0 <2.0.0)
+        assert!(super::is_range_already_compatible("~1.2.3", "^1.0.0"));
+    }
+
+    #[test]
+    fn range_incompatible_caret_not_in_tilde() {
+        // ^1.0.0 (>=1.0.0 <2.0.0) is NOT within ~1.2.3 (>=1.2.3 <1.3.0)
+        assert!(!super::is_range_already_compatible("^1.0.0", "~1.2.3"));
+    }
+
+    #[test]
+    fn range_compatible_or_range_within_star() {
+        // ^17 || ^18 is within * (any version)
+        assert!(super::is_range_already_compatible("^17 || ^18", ">=0.0.0"));
+    }
+
+    #[test]
+    fn range_unparseable_returns_false() {
+        // Dist tags, git URLs, etc. should return false (allow update)
+        assert!(!super::is_range_already_compatible("latest", "^1.0.0"));
+        assert!(!super::is_range_already_compatible(
+            "^1.0.0",
+            "git+ssh://foo"
+        ));
+    }
+
+    #[test]
+    fn range_compatible_prerelease() {
+        // ^6.30.3-pre-v6.0 should be within ^6.0.0
+        assert!(super::is_range_already_compatible(
+            "^6.30.3-pre-v6.0",
+            "^6.0.0"
+        ));
     }
 }
