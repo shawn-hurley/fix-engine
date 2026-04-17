@@ -154,15 +154,51 @@ fn run_yarn_install_and_resolve_peers(project_root: &Path) {
         return;
     }
 
+    // Build version-qualified install specs by looking up each peer's
+    // required version range from the requesting package's peerDependencies
+    // in node_modules. This prevents installing incompatible latest versions.
+    let mut install_specs: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for peer in &missing_peers {
+        if !seen.insert(peer.peer_name.clone()) {
+            continue;
+        }
+
+        match lookup_peer_dep_version(project_root, &peer.requested_by, &peer.peer_name) {
+            Some(version_range) => {
+                tracing::info!(
+                    peer = %peer.peer_name,
+                    version = %version_range,
+                    requested_by = %peer.requested_by,
+                    "Resolved peer dep version range from requesting package"
+                );
+                install_specs.push(format!("{}@{}", peer.peer_name, version_range));
+            }
+            None => {
+                tracing::warn!(
+                    peer = %peer.peer_name,
+                    requested_by = %peer.requested_by,
+                    "Could not resolve peer dep version; skipping to avoid installing incompatible version"
+                );
+            }
+        }
+    }
+
+    if install_specs.is_empty() {
+        tracing::info!("No peer dependencies with resolved versions to install");
+        return;
+    }
+
     tracing::info!(
-        count = missing_peers.len(),
-        peers = ?missing_peers,
-        "Installing missing peer dependencies detected from yarn warnings"
+        count = install_specs.len(),
+        specs = ?install_specs,
+        "Installing missing peer dependencies with resolved versions"
     );
 
     let add_result = std::process::Command::new("yarn")
         .arg("add")
-        .args(&missing_peers)
+        .args(&install_specs)
         .env("YARN_ENABLE_SCRIPTS", "false")
         .current_dir(project_root)
         .output();
@@ -181,6 +217,15 @@ fn run_yarn_install_and_resolve_peers(project_root: &Path) {
     }
 }
 
+/// A missing peer dependency detected from yarn's YN0002 warnings.
+#[derive(Debug, Clone)]
+struct MissingPeerDep {
+    /// The missing peer package name (e.g., "victory")
+    peer_name: String,
+    /// The package that requires it (e.g., "@patternfly/react-charts")
+    requested_by: String,
+}
+
 /// Parse yarn berry output for YN0002 (missing peer dependency) warnings.
 ///
 /// Yarn berry emits lines like:
@@ -189,26 +234,56 @@ fn run_yarn_install_and_resolve_peers(project_root: &Path) {
 /// ```
 ///
 /// The output contains ANSI escape codes which are stripped before matching.
-/// Returns a deduplicated list of missing peer package names.
-fn parse_yarn_missing_peer_deps(output: &str) -> Vec<String> {
+/// Returns a list of `MissingPeerDep` with both the peer name and the
+/// requesting package, so the caller can look up the required version range.
+fn parse_yarn_missing_peer_deps(output: &str) -> Vec<MissingPeerDep> {
     // Strip ANSI escape codes: ESC[ followed by parameters and a letter
     let ansi_re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("valid regex");
     let stripped = ansi_re.replace_all(output, "");
 
     // Match YN0002 lines:
-    //   YN0002: <locator> doesn't provide <peer_name> (<hash>), requested by ...
-    // The peer name can be scoped (e.g., @scope/pkg) or unscoped.
-    let peer_re =
-        regex::Regex::new(r"YN0002: .+ doesn't provide (@?[^\s(]+) \(").expect("valid regex");
+    //   YN0002: <requester>@npm:<version> doesn't provide <peer_name> (<hash>), ...
+    // Both requester and peer name can be scoped (e.g., @scope/pkg).
+    let peer_re = regex::Regex::new(r"YN0002: (@?[^@\s]+)@\S+ doesn't provide (@?[^\s(]+) \(")
+        .expect("valid regex");
 
     let mut seen = std::collections::HashSet::new();
     peer_re
         .captures_iter(&stripped)
         .filter_map(|cap| {
-            let name = cap[1].to_string();
-            seen.insert(name.clone()).then_some(name)
+            let requested_by = cap[1].to_string();
+            let peer_name = cap[2].to_string();
+            // Deduplicate by peer_name — use the first requester encountered
+            seen.insert(peer_name.clone()).then_some(MissingPeerDep {
+                peer_name,
+                requested_by,
+            })
         })
         .collect()
+}
+
+/// Look up the required version range for a peer dependency from the
+/// requesting package's `peerDependencies` in `node_modules`.
+///
+/// Returns the version range string (e.g., `"^37.3.6"`) if found.
+fn lookup_peer_dep_version(
+    project_root: &Path,
+    requested_by: &str,
+    peer_name: &str,
+) -> Option<String> {
+    let pkg_json_path = project_root
+        .join("node_modules")
+        .join(requested_by)
+        .join("package.json");
+
+    let content = std::fs::read_to_string(&pkg_json_path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    parsed
+        .get("peerDependencies")?
+        .get(peer_name)?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// Run `pnpm install` with auto-install-peers enabled via env var.
@@ -1535,8 +1610,10 @@ mod tests {
 ";
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert_eq!(peers.len(), 2);
-        assert!(peers.contains(&"victory".to_string()));
-        assert!(peers.contains(&"victory-core".to_string()));
+        assert_eq!(peers[0].peer_name, "victory");
+        assert_eq!(peers[0].requested_by, "@patternfly/react-charts");
+        assert_eq!(peers[1].peer_name, "victory-core");
+        assert_eq!(peers[1].requested_by, "@patternfly/react-charts");
     }
 
     #[test]
@@ -1544,14 +1621,18 @@ mod tests {
         // Simulate ANSI color codes wrapping the warning code
         let output = "\x1b[33m➤\x1b[0m \x1b[33mYN0002\x1b[0m: \x1b[38;5;173mfoo@npm:1.0.0\x1b[0m doesn't provide \x1b[38;5;111mbar\x1b[0m (p7g8h9), requested by baz.\n";
         let peers = super::parse_yarn_missing_peer_deps(output);
-        assert_eq!(peers, vec!["bar"]);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer_name, "bar");
+        assert_eq!(peers[0].requested_by, "foo");
     }
 
     #[test]
     fn parse_yarn_missing_peers_scoped_package() {
-        let output = "➤ YN0002: some-pkg@npm:2.0.0 doesn't provide @scope/peer-pkg (pabcde), requested by other-dep.\n";
+        let output = "➤ YN0002: @scope/some-pkg@npm:2.0.0 doesn't provide @scope/peer-pkg (pabcde), requested by other-dep.\n";
         let peers = super::parse_yarn_missing_peer_deps(output);
-        assert_eq!(peers, vec!["@scope/peer-pkg"]);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer_name, "@scope/peer-pkg");
+        assert_eq!(peers[0].requested_by, "@scope/some-pkg");
     }
 
     #[test]
@@ -1563,7 +1644,9 @@ mod tests {
 ";
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0], "victory");
+        assert_eq!(peers[0].peer_name, "victory");
+        // First requester wins for deduplication
+        assert_eq!(peers[0].requested_by, "pkg-a");
     }
 
     #[test]
@@ -1571,6 +1654,46 @@ mod tests {
         let output = "➤ YN0000: · Yarn 4.6.0\n➤ YN0000: · Done in 0.5s\n";
         let peers = super::parse_yarn_missing_peer_deps(output);
         assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn lookup_peer_dep_version_finds_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir.path().join("node_modules/@patternfly/react-charts");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("package.json"),
+            r#"{
+  "name": "@patternfly/react-charts",
+  "peerDependencies": {
+    "victory-core": "^37.3.6",
+    "echarts": "^5.6.0 || ^6.0.0"
+  }
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::lookup_peer_dep_version(dir.path(), "@patternfly/react-charts", "victory-core"),
+            Some("^37.3.6".to_string())
+        );
+        assert_eq!(
+            super::lookup_peer_dep_version(dir.path(), "@patternfly/react-charts", "echarts"),
+            Some("^5.6.0 || ^6.0.0".to_string())
+        );
+        assert_eq!(
+            super::lookup_peer_dep_version(dir.path(), "@patternfly/react-charts", "nonexistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_peer_dep_version_missing_package() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::lookup_peer_dep_version(dir.path(), "nonexistent-pkg", "some-peer"),
+            None
+        );
     }
 
     // ── semver range compatibility tests ──
