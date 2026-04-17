@@ -7,15 +7,15 @@ konveyor-core = "0.0.4"
 
 [package]
 name = "fix-engine-cli"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Generic fix engine CLI for applying pattern-based and LLM-assisted code migration fixes"
 license = "Apache-2.0"
 
 [dependencies]
-fix-engine-core = { version = "0.0.1", path = "crates/core" }
-fix-engine = { version = "0.0.1", path = "crates/engine" }
-fix-engine-js-fix = { version = "0.0.1", path = "crates/js-fix" }
+fix-engine-core = { version = "0.0.2", path = "crates/core" }
+fix-engine = { version = "0.0.2", path = "crates/engine" }
+fix-engine-js-fix = { version = "0.0.2", path = "crates/js-fix" }
 konveyor-core = { workspace = true }
 
 # Async runtime

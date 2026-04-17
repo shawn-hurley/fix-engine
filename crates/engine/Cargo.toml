@@ -1,12 +1,12 @@
 [package]
 name = "fix-engine"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "Language-agnostic fix engine for applying pattern-based and LLM-assisted code migration fixes"
 license = "Apache-2.0"
 
 [dependencies]
-fix-engine-core = { version = "0.0.1", path = "../core" }
+fix-engine-core = { version = "0.0.2", path = "../core" }
 konveyor-core = { workspace = true }
 
 # Error handling
