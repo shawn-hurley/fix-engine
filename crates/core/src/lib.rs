@@ -146,6 +146,8 @@ pub enum FixStrategy {
     CssVariablePrefix {
         old_prefix: String,
         new_prefix: String,
+        /// CSS classes to exclude from this prefix swap (dead after swap).
+        exclude_patterns: Vec<String>,
     },
     /// Ensure a dependency exists at the correct version in the project manifest
     /// (e.g., package.json for Node.js, Cargo.toml for Rust, go.mod for Go).
@@ -201,6 +203,7 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
                 FixStrategy::CssVariablePrefix {
                     old_prefix: from.clone(),
                     new_prefix: to.clone(),
+                    exclude_patterns: entry.exclude_patterns.clone(),
                 }
             } else {
                 FixStrategy::Manual
@@ -568,9 +571,11 @@ mod tests {
             FixStrategy::CssVariablePrefix {
                 old_prefix,
                 new_prefix,
+                exclude_patterns,
             } => {
                 assert_eq!(old_prefix, "pf-v5-");
                 assert_eq!(new_prefix, "pf-v6-");
+                assert!(exclude_patterns.is_empty());
             }
             other => panic!("Expected CssVariablePrefix, got {:?}", other),
         }

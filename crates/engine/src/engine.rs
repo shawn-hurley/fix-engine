@@ -86,7 +86,47 @@ pub fn plan_fixes(
                     FixStrategy::CssVariablePrefix {
                         old_prefix,
                         new_prefix,
+                        exclude_patterns,
                     } => {
+                        // Check if this incident matches a dead-class exclusion.
+                        // If the matched text contains an excluded pattern (a CSS
+                        // class that was removed, not just prefix-renamed), skip
+                        // the automated prefix swap. The dead-class rule will flag
+                        // this incident for manual review separately.
+                        let matched_text = incident
+                            .variables
+                            .get("matchingText")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                incident.variables.get("className").and_then(|v| v.as_str())
+                            })
+                            .unwrap_or("");
+
+                        if !exclude_patterns.is_empty()
+                            && exclude_patterns
+                                .iter()
+                                .any(|excl| matched_text.contains(excl.as_str()))
+                        {
+                            tracing::debug!(
+                                rule_id = %rule_id,
+                                matched = %matched_text,
+                                "Skipping CssVariablePrefix for dead class (excluded pattern)"
+                            );
+                            // Emit as manual review instead
+                            plan.manual.push(ManualFixItem {
+                                rule_id: rule_id.clone(),
+                                file_uri: incident.file_uri.clone(),
+                                line: incident.line_number.unwrap_or(0),
+                                message: format!(
+                                    "CSS class '{}' was removed — prefix swap would produce a non-existent class. {}",
+                                    matched_text,
+                                    incident.message
+                                ),
+                                code_snip: incident.code_snip.clone(),
+                            });
+                            continue;
+                        }
+
                         // Treat CSS prefix changes as renames
                         let mappings = vec![RenameMapping {
                             old: old_prefix.clone(),
