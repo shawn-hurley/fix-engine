@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 fix-engine-core = { version = "0.0.1", path = "../core" }
-konveyor-core = "0.0.4"
+konveyor-core = { workspace = true }
 
 # Error handling
 anyhow = "1"

@@ -2,6 +2,9 @@
 members = ["crates/core", "crates/engine", "crates/js-fix"]
 resolver = "2"
 
+[workspace.dependencies]
+konveyor-core = "0.0.4"
+
 [package]
 name = "fix-engine-cli"
 version = "0.0.1"
@@ -13,7 +16,7 @@ license = "Apache-2.0"
 fix-engine-core = { version = "0.0.1", path = "crates/core" }
 fix-engine = { version = "0.0.1", path = "crates/engine" }
 fix-engine-js-fix = { version = "0.0.1", path = "crates/js-fix" }
-konveyor-core = "0.0.4"
+konveyor-core = { workspace = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

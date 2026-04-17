@@ -116,6 +116,22 @@ jobs:
       - name: Wait for crates.io index update
         run: sleep 30
 
+      - name: Publish fix-engine-js-fix
+        run: |
+          output=$(cargo publish --package fix-engine-js-fix 2>&1) && echo "$output" || {
+            if echo "$output" | grep -q "already exists"; then
+              echo "fix-engine-js-fix already published, skipping"
+            else
+              echo "$output"
+              exit 1
+            fi
+          }
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update
+        run: sleep 30
+
       - name: Publish fix-engine-cli
         run: |
           output=$(cargo publish --package fix-engine-cli 2>&1) && echo "$output" || {
@@ -167,7 +183,8 @@ jobs:
           for manifest in \
             Cargo.toml \
             crates/core/Cargo.toml \
-            crates/engine/Cargo.toml; do
+            crates/engine/Cargo.toml \
+            crates/js-fix/Cargo.toml; do
             # Bump package version (start-of-line version = "...")
             sed -i "s/^version *= *\"${CURRENT}\"/version = \"${NEXT}\"/" "$manifest"
             # Bump workspace dependency version constraints (inline version = "...")
