@@ -714,9 +714,7 @@ dependencies = [
 
 [[package]]
 name = "konveyor-core"
-version = "0.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c9c96e6749f85b6b00f8ab86c57c4d49359c98d93b02f731c98df529aff2662"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "serde",

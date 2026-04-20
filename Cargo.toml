@@ -3,7 +3,10 @@ members = ["crates/core", "crates/engine", "crates/js-fix"]
 resolver = "2"
 
 [workspace.dependencies]
-konveyor-core = "0.0.4"
+konveyor-core = "0.0.5"
+
+[patch.crates-io]
+konveyor-core = { path = "../konveyor-core" }
 
 [package]
 name = "fix-engine-cli"

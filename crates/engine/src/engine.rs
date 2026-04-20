@@ -571,6 +571,72 @@ pub fn consolidate_family_requests(
                 entry.removed_imports.join(", ")
             ));
         }
+        if !entry.prop_value_changes.is_empty() {
+            message.push_str("\nProp value changes:\n");
+            for (prop, mappings) in &entry.prop_value_changes {
+                for m in mappings {
+                    if let (Some(from), Some(to)) = (&m.from, &m.to) {
+                        message.push_str(&format!("  {}: {} -> {}\n", prop, from, to));
+                    }
+                }
+            }
+        }
+        if !entry.prop_type_changes.is_empty() {
+            message.push_str("\nProp type changes:\n");
+            for (prop, mappings) in &entry.prop_type_changes {
+                for m in mappings {
+                    match (&m.from, &m.to) {
+                        (Some(from), Some(to)) => {
+                            message.push_str(&format!("  {}: {} -> {}\n", prop, from, to));
+                        }
+                        (None, Some(to)) => {
+                            message.push_str(&format!(
+                                "  {} (current signature): {}\n",
+                                prop, to
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(ref dm) = entry.deprecated_migration {
+            message.push_str(&format!(
+                "\nDeprecated -> v6 migration:\n  Old import: {}\n  New import: {}\n",
+                dm.old_package, dm.new_package
+            ));
+            if !dm.matching_props.is_empty() {
+                message.push_str("Matching props:\n");
+                for p in &dm.matching_props {
+                    if p.type_changed {
+                        message.push_str(&format!(
+                            "  {} -> {} (TYPE CHANGED):\n    old: {}\n    new: {}\n",
+                            p.old_name,
+                            p.new_name,
+                            p.old_type.as_deref().unwrap_or("?"),
+                            p.new_type.as_deref().unwrap_or("?")
+                        ));
+                    } else if p.old_name != p.new_name {
+                        message.push_str(&format!(
+                            "  {} -> {} (renamed, type unchanged)\n",
+                            p.old_name, p.new_name
+                        ));
+                    }
+                }
+            }
+            if !dm.new_props.is_empty() {
+                message.push_str("New props on replacement:\n");
+                for (name, typ) in &dm.new_props {
+                    message.push_str(&format!("  {}: {}\n", name, typ));
+                }
+            }
+            if !dm.removed_props.is_empty() {
+                message.push_str(&format!(
+                    "Removed props (no replacement equivalent): {}\n",
+                    dm.removed_props.join(", ")
+                ));
+            }
+        }
 
         // Collect all incident data from the grouped requests.
         let filtered_indices: Vec<usize> = {

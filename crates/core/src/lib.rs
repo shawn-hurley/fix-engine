@@ -380,6 +380,25 @@ fn format_family_migration_context(entry: &FixStrategyEntry) -> String {
             parts.push(format!("Prop value changes:\n{}", lines.join("\n")));
         }
     }
+    if !entry.prop_type_changes.is_empty() {
+        let mut lines = Vec::new();
+        for (prop, mappings) in &entry.prop_type_changes {
+            for m in mappings {
+                match (&m.from, &m.to) {
+                    (Some(from), Some(to)) => {
+                        lines.push(format!("  {}: {} -> {}", prop, from, to));
+                    }
+                    (None, Some(to)) => {
+                        lines.push(format!("  {} (current signature): {}", prop, to));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !lines.is_empty() {
+            parts.push(format!("Prop type changes:\n{}", lines.join("\n")));
+        }
+    }
 
     // Deprecated -> v6 migration context: complete prop mapping with types.
     if let Some(ref dm) = entry.deprecated_migration {

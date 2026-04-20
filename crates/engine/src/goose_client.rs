@@ -934,7 +934,8 @@ Instructions:
 1. Read the file at {file_path}
 2. Apply ONLY the change described by the migration rule at or near line {lines}
 3. Make the minimum edit necessary — do not change unrelated code, but DO clean up any artifacts caused by your change (e.g., remove imports that are no longer referenced, delete dead declarations)
-4. Write the fixed file
+4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
+5. Write the fixed file
 {constraints_section}
 
 Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it.
@@ -1108,8 +1109,9 @@ Instructions:
    b. Determine the specific change needed ({change_examples})
    c. Track all changes for the final write
 3. Make the minimum edits necessary — do not change unrelated code, but DO clean up any artifacts caused by your changes (e.g., remove imports that are no longer referenced, delete dead declarations)
-4. Do NOT revert any changes that were already applied in previous passes
-5. Write the fixed file once with ALL changes from every fix applied
+4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
+5. Do NOT revert any changes that were already applied in previous passes
+6. Write the fixed file once with ALL changes from every fix applied
 {constraints_section}
 {verification_section}
 Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it.
