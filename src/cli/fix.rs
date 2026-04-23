@@ -90,6 +90,20 @@ pub struct FixOpts {
     /// Control colored output.
     #[arg(long, value_enum, default_value_t)]
     pub color: ColorMode,
+
+    /// Timeout in seconds for each goose subprocess invocation.
+    #[arg(long, default_value_t = 120)]
+    pub goose_timeout: u64,
+
+    /// Maximum number of distinct component-family rules per goose chunk.
+    ///
+    /// Family rules (e.g., family:Dropdown, family:Page) represent complex
+    /// structural migrations. Limiting how many go into a single chunk keeps
+    /// each goose invocation focused and reduces the chance of timeouts.
+    /// Non-family rules (simple renames, import swaps) are not counted
+    /// against this limit.
+    #[arg(long, default_value_t = 2)]
+    pub goose_max_families: usize,
 }
 
 pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) -> Result<()> {
@@ -321,6 +335,8 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                         opts.verbose,
                         opts.log_dir.as_deref(),
                         &printer,
+                        opts.goose_timeout,
+                        opts.goose_max_families,
                     );
 
                     let succeeded = results.iter().filter(|r| r.success).count();

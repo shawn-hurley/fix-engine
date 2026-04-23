@@ -15,9 +15,6 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-/// Per-file timeout for goose subprocess (seconds).
-const GOOSE_TIMEOUT_SECS: u64 = 120;
-
 /// Result of a goose fix attempt.
 #[derive(Debug)]
 pub struct GooseFixResult {
@@ -32,7 +29,11 @@ pub struct GooseFixResult {
 /// Return type from goose: (success, text_response, raw_json_output)
 /// The raw_json_output contains the full goose session including all
 /// tool calls, which is invaluable for debugging empty responses.
-fn run_goose_with_timeout(prompt: &str, max_turns: &str) -> Result<(bool, String, String)> {
+fn run_goose_with_timeout(
+    prompt: &str,
+    max_turns: &str,
+    timeout_secs: u64,
+) -> Result<(bool, String, String)> {
     let mut cmd = Command::new("goose");
     cmd.args([
         "run",
@@ -61,7 +62,7 @@ fn run_goose_with_timeout(prompt: &str, max_turns: &str) -> Result<(bool, String
         .spawn()
         .context("Failed to execute goose. Is it installed and in PATH?")?;
 
-    let timeout = Duration::from_secs(GOOSE_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
     let start = std::time::Instant::now();
 
     loop {
@@ -117,7 +118,7 @@ fn run_goose_with_timeout(prompt: &str, max_turns: &str) -> Result<(bool, String
                         let _ = child.kill();
                     }
                     let _ = child.wait();
-                    anyhow::bail!("goose timed out after {}s", GOOSE_TIMEOUT_SECS);
+                    anyhow::bail!("goose timed out after {}s", timeout_secs);
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -287,6 +288,8 @@ pub fn run_all_goose_fixes(
     verbose: bool,
     log_dir: Option<&std::path::Path>,
     printer: &crate::progress::ProgressPrinter,
+    timeout_secs: u64,
+    max_families_per_chunk: usize,
 ) -> Vec<GooseFixResult> {
     // Create log directory if specified
     if let Some(dir) = log_dir {
@@ -388,6 +391,8 @@ pub fn run_all_goose_fixes(
                     ctx,
                     verbose,
                     log_dir,
+                    timeout_secs,
+                    max_families_per_chunk,
                 );
 
                 match &result {
@@ -451,6 +456,8 @@ fn process_single_file(
     ctx: &dyn FixContext,
     verbose: bool,
     log_dir: Option<&std::path::Path>,
+    timeout_secs: u64,
+    max_families_per_chunk: usize,
 ) -> (GooseFixResult, Vec<String>) {
     let mut log: Vec<String> = Vec::new();
 
@@ -485,7 +492,6 @@ fn process_single_file(
     // Each chunk runs sequentially — the LLM reads the file as modified
     // by the previous chunk. A context summary of previously applied
     // fixes is prepended to each subsequent chunk.
-    let max_fixes_per_batch = 8;
     let mut result: Result<GooseFixResult> = Ok(GooseFixResult {
         file_path: file_path.to_path_buf(),
         rule_id: String::new(),
@@ -503,7 +509,7 @@ fn process_single_file(
         let prompt = build_merged_prompt(&file_requests[0], ctx);
         all_prompts.push(prompt.clone());
         let max_turns_str = "5".to_string();
-        let mut goose_result = run_goose_with_timeout(&prompt, &max_turns_str);
+        let mut goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
         let mut was_retried = false;
         // Retry once on empty response
         if let Ok((_, ref output, _)) = goose_result {
@@ -511,7 +517,7 @@ fn process_single_file(
                 was_retried = true;
                 log.push(format!("         {}: empty response — retrying once...", file_name));
                 std::thread::sleep(Duration::from_secs(2));
-                goose_result = run_goose_with_timeout(&prompt, &max_turns_str);
+                goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
             }
         }
         match goose_result {
@@ -536,6 +542,16 @@ fn process_single_file(
         // must stay in the same chunk so the LLM sees the full migration
         // (composition + prop→child + conformance) as one coherent change.
         // A family group is treated as one logical unit regardless of size.
+        //
+        // Chunking is driven by the number of *distinct* component families
+        // in the current chunk (`max_families_per_chunk`). Family rules are
+        // the complex structural migrations that dominate LLM processing
+        // time, so limiting them keeps each goose invocation focused.
+        // Non-family rules (simple renames, import swaps) do not count
+        // against the family limit — they're cheap and fill remaining space.
+        // A secondary guard (`max_fixes_per_batch`) caps the total number
+        // of rules per chunk to avoid overwhelming the LLM regardless.
+        let max_fixes_per_batch = 8;
         let chunks: Vec<Vec<&MergedLlmFixRequest>> = {
             let mut result: Vec<Vec<&MergedLlmFixRequest>> = Vec::new();
             let mut current_chunk: Vec<&MergedLlmFixRequest> = Vec::new();
@@ -546,6 +562,14 @@ fn process_single_file(
                 if let Some(ref fam) = req.family {
                     if current_families.contains(fam) {
                         // Same family — always add to current chunk
+                        current_chunk.push(req);
+                    } else if current_families.len() >= max_families_per_chunk
+                        && !current_chunk.is_empty()
+                    {
+                        // New family but we've hit the family limit — start new chunk
+                        result.push(std::mem::take(&mut current_chunk));
+                        current_families.clear();
+                        current_families.insert(fam.clone());
                         current_chunk.push(req);
                     } else if current_chunk.len() >= max_fixes_per_batch
                         && !current_chunk.is_empty()
@@ -604,7 +628,7 @@ fn process_single_file(
             let max_turns = (22 + chunk.len()).min(40);
             let max_turns_str = max_turns.to_string();
             let chunk_start = std::time::Instant::now();
-            let mut chunk_result = run_goose_with_timeout(&prompt, &max_turns_str);
+            let mut chunk_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
             let mut was_retried = false;
 
             // Retry once on empty response. Goose sometimes returns an
@@ -631,7 +655,7 @@ fn process_single_file(
                          just because some are — check EVERY one.",
                         prompt,
                     );
-                    chunk_result = run_goose_with_timeout(&retry_prompt, &max_turns_str);
+                    chunk_result = run_goose_with_timeout(&retry_prompt, &max_turns_str, timeout_secs);
                 }
             }
 
@@ -777,7 +801,7 @@ fn process_single_file(
                         ));
                         std::thread::sleep(backoff);
                         let _retry_start = std::time::Instant::now();
-                        let retry_result = run_goose_with_timeout(&prompt, &max_turns_str);
+                        let retry_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
                         match retry_result {
                             Ok((success, output, _retry_stderr)) => {
                                 for req in chunk.iter() {
