@@ -353,6 +353,7 @@ fn deduplicate_edits(plan: &mut FixPlan) {
             line: u32,
             old_text: String,
             new_text: String,
+            replace_all: bool,
         }
 
         let mut all_edits: Vec<EditRef> = Vec::new();
@@ -364,6 +365,7 @@ fn deduplicate_edits(plan: &mut FixPlan) {
                     line: edit.line,
                     old_text: edit.old_text.clone(),
                     new_text: edit.new_text.clone(),
+                    replace_all: edit.replace_all,
                 });
             }
         }
@@ -425,10 +427,23 @@ fn deduplicate_edits(plan: &mut FixPlan) {
                     continue;
                 }
 
-                // Subsumed: this edit's old_text is a substring of a kept edit's old_text
-                let subsumed = kept_old_texts
-                    .iter()
-                    .any(|kept_old| kept_old.contains(&er.old_text));
+                // Subsumed: this edit's old_text is a substring of a kept edit's
+                // old_text.  However, when BOTH the kept edit and the candidate
+                // use `replace_all`, they can safely coexist: the longer edit is
+                // applied first (via `str::replace`), removing any overlapping
+                // occurrences, and the shorter edit then catches remaining
+                // independent occurrences on the same line.
+                //
+                // Example:
+                //   className="pf-v5-c-form__label pf-v5-c-form__label-text"
+                //   Edit A (kept): "pf-v5-c-form__label-text" → "pf-v6-c-form__label-text"
+                //   Edit B (this): "pf-v5-c-form__label"      → "pf-v6-c-form__label"
+                //   Both replace_all=true → B survives to fix the standalone occurrence.
+                let subsumed = kept.iter().any(|&k| {
+                    let ek = &all_edits[k];
+                    ek.old_text.contains(&er.old_text)
+                        && !(er.replace_all && ek.replace_all)
+                });
                 if subsumed {
                     remove_set.insert((er.fix_idx, er.edit_idx));
                     total_subsumed += 1;
@@ -1604,5 +1619,175 @@ export {
                 .contains("To: property: splitButtonItems: ReactNode[]"),
             "fix strategy 'to' should be preserved"
         );
+    }
+
+    // -- deduplicate_edits tests --
+
+    /// Helper to build a PlannedFix with a single TextEdit.
+    fn make_edit(line: u32, old: &str, new: &str, replace_all: bool) -> PlannedFix {
+        PlannedFix {
+            edits: vec![TextEdit {
+                line,
+                old_text: old.into(),
+                new_text: new.into(),
+                rule_id: "test".into(),
+                description: "test".into(),
+                replace_all,
+            }],
+            confidence: konveyor_core::fix::FixConfidence::Exact,
+            source: konveyor_core::fix::FixSource::Pattern,
+            rule_id: "test".into(),
+            file_uri: "file:///test.tsx".into(),
+            line,
+            description: "test".into(),
+        }
+    }
+
+    #[test]
+    fn test_dedup_replace_all_substring_edits_both_survive() {
+        // Bug scenario: two CSS class renames on the same line, one is a
+        // substring of the other. Both have replace_all=true.
+        // className="pf-v5-c-form__label pf-v5-c-form__label-text"
+        //
+        // Before fix: the shorter edit ("pf-v5-c-form__label") was subsumed
+        // because it's a substring of the longer ("pf-v5-c-form__label-text").
+        // After fix: both survive because replace_all edits applied
+        // longest-first are safe.
+        let mut plan = FixPlan::default();
+        let file = PathBuf::from("/test.tsx");
+        plan.files.insert(
+            file.clone(),
+            vec![
+                make_edit(10, "pf-v5-c-form__label-text", "pf-v6-c-form__label-text", true),
+                make_edit(10, "pf-v5-c-form__label", "pf-v6-c-form__label", true),
+            ],
+        );
+
+        deduplicate_edits(&mut plan);
+
+        let edits: Vec<&TextEdit> = plan.files[&file]
+            .iter()
+            .flat_map(|f| &f.edits)
+            .collect();
+        assert_eq!(
+            edits.len(),
+            2,
+            "Both replace_all edits should survive dedup, got {}",
+            edits.len()
+        );
+        assert_eq!(plan.edits_subsumed, 0);
+    }
+
+    #[test]
+    fn test_dedup_non_replace_all_substring_still_subsumed() {
+        // When replace_all=false, the old behavior should be preserved:
+        // a shorter old_text that's a substring of a longer kept edit is
+        // subsumed.
+        let mut plan = FixPlan::default();
+        let file = PathBuf::from("/test.tsx");
+        plan.files.insert(
+            file.clone(),
+            vec![
+                make_edit(10, "FooBar", "BazBar", false),
+                make_edit(10, "Foo", "Baz", false),
+            ],
+        );
+
+        deduplicate_edits(&mut plan);
+
+        let edits: Vec<&TextEdit> = plan.files[&file]
+            .iter()
+            .flat_map(|f| &f.edits)
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "Non-replace_all shorter edit should be subsumed, got {}",
+            edits.len()
+        );
+        assert_eq!(edits[0].old_text, "FooBar");
+        assert_eq!(plan.edits_subsumed, 1);
+    }
+
+    #[test]
+    fn test_dedup_mixed_replace_all_substring_subsumed() {
+        // When one edit is replace_all and the other is not, the shorter
+        // edit is still subsumed (conservative behavior).
+        let mut plan = FixPlan::default();
+        let file = PathBuf::from("/test.tsx");
+        plan.files.insert(
+            file.clone(),
+            vec![
+                make_edit(10, "pf-v5-c-form__label-text", "pf-v6-c-form__label-text", true),
+                make_edit(10, "pf-v5-c-form__label", "pf-v6-c-form__label", false),
+            ],
+        );
+
+        deduplicate_edits(&mut plan);
+
+        let edits: Vec<&TextEdit> = plan.files[&file]
+            .iter()
+            .flat_map(|f| &f.edits)
+            .collect();
+        assert_eq!(
+            edits.len(),
+            1,
+            "Mixed replace_all: shorter non-replace_all should be subsumed"
+        );
+        assert_eq!(edits[0].old_text, "pf-v5-c-form__label-text");
+    }
+
+    #[test]
+    fn test_dedup_triple_nesting_replace_all() {
+        // Three CSS classes with shared prefix, all replace_all=true.
+        // All three should survive.
+        let mut plan = FixPlan::default();
+        let file = PathBuf::from("/test.tsx");
+        plan.files.insert(
+            file.clone(),
+            vec![
+                make_edit(10, "pf-v5-c-form__label-required", "pf-v6-c-form__label-required", true),
+                make_edit(10, "pf-v5-c-form__label-text", "pf-v6-c-form__label-text", true),
+                make_edit(10, "pf-v5-c-form__label", "pf-v6-c-form__label", true),
+            ],
+        );
+
+        deduplicate_edits(&mut plan);
+
+        let edits: Vec<&TextEdit> = plan.files[&file]
+            .iter()
+            .flat_map(|f| &f.edits)
+            .collect();
+        assert_eq!(
+            edits.len(),
+            3,
+            "All three replace_all edits should survive, got {}",
+            edits.len()
+        );
+        assert_eq!(plan.edits_subsumed, 0);
+    }
+
+    #[test]
+    fn test_dedup_exact_duplicate_still_removed() {
+        // Exact duplicates (same old+new) should still be removed,
+        // even with replace_all=true.
+        let mut plan = FixPlan::default();
+        let file = PathBuf::from("/test.tsx");
+        plan.files.insert(
+            file.clone(),
+            vec![
+                make_edit(10, "pf-v5-c-form__label", "pf-v6-c-form__label", true),
+                make_edit(10, "pf-v5-c-form__label", "pf-v6-c-form__label", true),
+            ],
+        );
+
+        deduplicate_edits(&mut plan);
+
+        let edits: Vec<&TextEdit> = plan.files[&file]
+            .iter()
+            .flat_map(|f| &f.edits)
+            .collect();
+        assert_eq!(edits.len(), 1, "Exact duplicate should be removed");
+        assert_eq!(plan.edits_subsumed, 1);
     }
 }
