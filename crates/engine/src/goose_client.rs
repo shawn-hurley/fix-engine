@@ -18,12 +18,6 @@ use std::os::unix::process::CommandExt;
 /// Per-file timeout for goose subprocess (seconds).
 const GOOSE_TIMEOUT_SECS: u64 = 120;
 
-/// Delay between consecutive goose calls to avoid rate limiting (seconds).
-const _GOOSE_DELAY_SECS: u64 = 2;
-
-/// Maximum retries when a goose call times out.
-const _GOOSE_MAX_RETRIES: u32 = 1;
-
 /// Result of a goose fix attempt.
 #[derive(Debug)]
 pub struct GooseFixResult {
@@ -292,6 +286,7 @@ pub fn run_all_goose_fixes(
     ctx: &dyn FixContext,
     verbose: bool,
     log_dir: Option<&std::path::Path>,
+    printer: &crate::progress::ProgressPrinter,
 ) -> Vec<GooseFixResult> {
     // Create log directory if specified
     if let Some(dir) = log_dir {
@@ -339,13 +334,16 @@ pub fn run_all_goose_fixes(
 
     let total_files = merged_by_file.len();
     let total_fixes = requests.len();
-    eprintln!(
-        "  Processing {} fixes across {} files via goose ({} concurrent)...\n",
-        total_fixes, total_files, MAX_CONCURRENT_FILES
+
+    let bar = printer.start_counted(
+        &format!(
+            "Goose fixes ({} fixes across {} files, {} concurrent)",
+            total_fixes, total_files, MAX_CONCURRENT_FILES,
+        ),
+        total_files as u64,
     );
 
     let pipeline_start = std::time::Instant::now();
-    let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let succeeded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -361,6 +359,11 @@ pub fn run_all_goose_fixes(
         .map(|(i, (path, reqs))| (i, path, reqs))
         .collect();
 
+    // Mutex to serialize flushing of per-file log buffers so that
+    // output for each file appears as a contiguous block even when
+    // multiple files finish at roughly the same time.
+    let flush_lock = std::sync::Mutex::new(());
+
     let results: Vec<GooseFixResult> = std::thread::scope(|s| {
         let mut handles = Vec::new();
 
@@ -369,13 +372,15 @@ pub fn run_all_goose_fixes(
             sem_rx.recv().unwrap();
 
             let sem_tx = sem_tx.clone();
-            let done = completed.clone();
             let ok_count = succeeded.clone();
             let fail_count = failed_count.clone();
             let i = *i;
+            let printer = printer.clone();
+            let bar = bar.clone();
+            let flush_lock = &flush_lock;
 
             let handle = s.spawn(move || {
-                let result = process_single_file(
+                let (result, log_lines) = process_single_file(
                     i,
                     total_files,
                     file_path,
@@ -385,7 +390,6 @@ pub fn run_all_goose_fixes(
                     log_dir,
                 );
 
-                let idx = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 match &result {
                     r if r.success => {
                         ok_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -394,7 +398,16 @@ pub fn run_all_goose_fixes(
                         fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                eprintln!("  [{}/{}] complete", idx, total_files,);
+                bar.inc();
+
+                // Flush all log lines as a contiguous block under the
+                // mutex so output from different files never interleaves.
+                {
+                    let _guard = flush_lock.lock().unwrap();
+                    for line in &log_lines {
+                        printer.println(line);
+                    }
+                }
 
                 // Release semaphore slot
                 let _ = sem_tx.send(());
@@ -407,16 +420,18 @@ pub fn run_all_goose_fixes(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    bar.finish();
+
     let total_elapsed = pipeline_start.elapsed();
     let ok = succeeded.load(std::sync::atomic::Ordering::Relaxed);
     let fail = failed_count.load(std::sync::atomic::Ordering::Relaxed);
-    eprintln!(
+    printer.println(&format!(
         "  Goose complete: {} succeeded, {} failed ({:.0}s total, {:.1}s avg per file)",
         ok,
         fail,
         total_elapsed.as_secs_f64(),
         total_elapsed.as_secs_f64() / total_files.max(1) as f64,
-    );
+    ));
 
     results
 }
@@ -424,6 +439,10 @@ pub fn run_all_goose_fixes(
 /// Process all fixes for a single file. Chunks are processed sequentially
 /// within the file (each chunk reads the file as modified by the previous).
 /// This function is called from parallel threads — one per file.
+///
+/// Returns `(GooseFixResult, Vec<String>)` where the second element is
+/// buffered log lines. The caller flushes these through the shared printer
+/// under a mutex so that per-file output is never interleaved.
 fn process_single_file(
     file_index: usize,
     total_files: usize,
@@ -432,7 +451,9 @@ fn process_single_file(
     ctx: &dyn FixContext,
     verbose: bool,
     log_dir: Option<&std::path::Path>,
-) -> GooseFixResult {
+) -> (GooseFixResult, Vec<String>) {
+    let mut log: Vec<String> = Vec::new();
+
     let file_name = file_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -449,14 +470,14 @@ fn process_single_file(
         )
     };
 
-    eprintln!(
+    log.push(format!(
         "  [{}/{}] {} ({} fixes) [{}]",
         file_index + 1,
         total_files,
         file_name,
         file_requests.len(),
         rules_display,
-    );
+    ));
 
     let file_start = std::time::Instant::now();
 
@@ -488,7 +509,7 @@ fn process_single_file(
         if let Ok((_, ref output, _)) = goose_result {
             if output.len() <= 1 {
                 was_retried = true;
-                eprintln!("         {}: empty response — retrying once...", file_name,);
+                log.push(format!("         {}: empty response — retrying once...", file_name));
                 std::thread::sleep(Duration::from_secs(2));
                 goose_result = run_goose_with_timeout(&prompt, &max_turns_str);
             }
@@ -557,13 +578,13 @@ fn process_single_file(
 
         for (chunk_idx, chunk) in chunks.iter().enumerate() {
             if chunk_idx > 0 {
-                eprintln!(
+                log.push(format!(
                     "         {}: chunk {}/{} ({} fixes)...",
                     file_name,
                     chunk_idx + 1,
                     chunk_count,
                     chunk.len()
-                );
+                ));
             }
 
             let chunk_refs: Vec<&MergedLlmFixRequest> = chunk.to_vec();
@@ -595,12 +616,12 @@ fn process_single_file(
             if let Ok((_, ref output, _)) = chunk_result {
                 if output.len() <= 1 {
                     was_retried = true;
-                    eprintln!(
+                    log.push(format!(
                         "         {}: chunk {}/{} empty response — retrying once...",
                         file_name,
                         chunk_idx + 1,
                         chunk_count,
-                    );
+                    ));
                     std::thread::sleep(Duration::from_secs(2));
                     let retry_prompt = format!(
                         "{}\n\n\
@@ -632,7 +653,7 @@ fn process_single_file(
                         .and_then(|j| j.get("messages")?.as_array().map(|a| a.len()))
                         .unwrap_or(0);
 
-                    eprintln!(
+                    log.push(format!(
                         "         {}: chunk {}/{} {} ({} fixes, {:.1}s, response={} chars, goose_messages={})",
                         file_name,
                         chunk_idx + 1,
@@ -642,7 +663,7 @@ fn process_single_file(
                         chunk_elapsed.as_secs_f64(),
                         resp_len,
                         msg_count,
-                    );
+                    ));
                     // If empty response, summarize what goose did from the JSON
                     if resp_len <= 1 {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stderr) {
@@ -665,20 +686,20 @@ fn process_single_file(
                                                         .get("name")
                                                         .and_then(|n| n.as_str())
                                                         .unwrap_or("?");
-                                                    eprintln!(
+                                                    log.push(format!(
                                                         "           goose: tool_call={}",
                                                         tool
-                                                    );
+                                                    ));
                                                 } else if typ == "text" {
                                                     let text = item
                                                         .get("text")
                                                         .and_then(|t| t.as_str())
                                                         .unwrap_or("");
                                                     if !text.is_empty() {
-                                                        eprintln!(
+                                                        log.push(format!(
                                                             "           goose: text={}",
                                                             &text[..text.len().min(100)]
-                                                        );
+                                                        ));
                                                     }
                                                 }
                                             }
@@ -687,7 +708,7 @@ fn process_single_file(
                                 }
                             }
                         } else if msg_count == 0 {
-                            eprintln!("           goose: no messages in output (goose may have failed silently)");
+                            log.push("           goose: no messages in output (goose may have failed silently)".to_string());
                         }
                     }
 
@@ -732,12 +753,12 @@ fn process_single_file(
                         output,
                     });
                     if !success {
-                        eprintln!(
+                        log.push(format!(
                             "         {}: chunk {}/{} FAILED, stopping",
                             file_name,
                             chunk_idx + 1,
                             chunk_count
-                        );
+                        ));
                         break;
                     }
                 }
@@ -746,14 +767,14 @@ fn process_single_file(
                     let err_msg = format!("{}", e);
                     if err_msg.contains("timed out") {
                         let backoff = Duration::from_secs(10);
-                        eprintln!(
+                        log.push(format!(
                             "         {}: chunk {}/{} timed out after {:.1}s, retrying in {}s...",
                             file_name,
                             chunk_idx + 1,
                             chunk_count,
                             chunk_elapsed.as_secs_f64(),
                             backoff.as_secs(),
-                        );
+                        ));
                         std::thread::sleep(backoff);
                         let _retry_start = std::time::Instant::now();
                         let retry_result = run_goose_with_timeout(&prompt, &max_turns_str);
@@ -808,17 +829,25 @@ fn process_single_file(
     match result {
         Ok(r) => {
             if r.success {
-                eprintln!("         {}: ok ({:.1}s)", file_name, elapsed.as_secs_f64());
+                log.push(format!("         {}: ok ({:.1}s)", file_name, elapsed.as_secs_f64()));
             } else {
-                eprintln!(
+                log.push(format!(
                     "         {}: FAILED ({:.1}s)",
                     file_name,
                     elapsed.as_secs_f64()
-                );
+                ));
             }
             if verbose && !r.output.is_empty() {
-                for line in r.output.lines().take(5) {
-                    eprintln!("           {}", line);
+                // Show the structured "Changes Applied" section if the LLM
+                // produced one; otherwise show the full raw output.
+                if let Some(summary) = extract_changes_applied(&r.output) {
+                    for line in summary.lines() {
+                        log.push(format!("           {}", line));
+                    }
+                } else {
+                    for line in r.output.lines() {
+                        log.push(format!("           {}", line));
+                    }
                 }
             }
 
@@ -862,16 +891,16 @@ fn process_single_file(
                 );
             }
 
-            r
+            (r, log)
         }
         Err(e) => {
-            eprintln!(
+            log.push(format!(
                 "         {}: ERROR ({:.1}s) — {}",
                 file_name,
                 elapsed.as_secs_f64(),
                 e
-            );
-            GooseFixResult {
+            ));
+            (GooseFixResult {
                 file_path: file_path.to_path_buf(),
                 rule_id: file_requests
                     .iter()
@@ -880,7 +909,7 @@ fn process_single_file(
                     .join(", "),
                 success: false,
                 output: format!("Error: {}", e),
-            }
+            }, log)
         }
     }
 }

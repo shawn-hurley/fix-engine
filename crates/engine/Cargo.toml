@@ -23,6 +23,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Utilities
 regex = "1"
 
+# Progress reporting
+indicatif = "0.17"
+owo-colors = "4"
+
 # Logging
 tracing = "0.1"
 

@@ -50,8 +50,9 @@ impl LanguageFixProvider for JsFixProvider {
         rule_id: &str,
         incident: &Incident,
         file_path: &Path,
+        report: &mut FixReport,
     ) -> Option<PlannedFix> {
-        plan_remove_prop(rule_id, incident, file_path)
+        plan_remove_prop(rule_id, incident, file_path, report)
     }
 
     fn plan_ensure_dependency(
@@ -61,8 +62,9 @@ impl LanguageFixProvider for JsFixProvider {
         package: &str,
         new_version: &str,
         file_path: &Path,
+        report: &mut FixReport,
     ) -> Vec<PlannedFix> {
-        plan_ensure_npm_dependency(rule_id, incident, package, new_version, file_path)
+        plan_ensure_npm_dependency(rule_id, incident, package, new_version, file_path, report)
     }
 
     fn get_matched_text(&self, incident: &Incident) -> String {
@@ -442,18 +444,42 @@ fn run_npm_install(project_root: &Path) {
 
 // -- JSX prop removal --
 
-fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Option<PlannedFix> {
-    let line = incident.line_number?;
-    let prop_name = incident
-        .variables
-        .get("propName")
-        .and_then(|v| v.as_str())?;
+fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path, report: &mut FixReport) -> Option<PlannedFix> {
+    let line = match incident.line_number {
+        Some(l) => l,
+        None => {
+            report.record_skip(rule_id, &incident.file_uri, None, SkipReason::NoLineNumber, None);
+            return None;
+        }
+    };
+    let prop_name = match incident.variables.get("propName").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::MissingVariable,
+                Some("propName".to_string()));
+            return None;
+        }
+    };
 
     // Read the actual file line to construct a precise removal edit.
-    let source = std::fs::read_to_string(file_path).ok()?;
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(e) => {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::FileUnreadable,
+                Some(e.to_string()));
+            return None;
+        }
+    };
     let all_lines: Vec<&str> = source.lines().collect();
     let line_idx = (line as usize).saturating_sub(1);
-    let file_line = all_lines.get(line_idx)?;
+    let file_line = match all_lines.get(line_idx) {
+        Some(l) => l,
+        None => {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::LineOutOfBounds,
+                Some(format!("file has {} lines", all_lines.len())));
+            return None;
+        }
+    };
     let trimmed = file_line.trim();
 
     // If the entire line is just the prop (common in formatted JSX), remove it.
@@ -490,18 +516,10 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
             }
 
             if cumulative_depth > 0 {
-                return Some(PlannedFix {
-                    edits: vec![],
-                    confidence: FixConfidence::Low,
-                    source: FixSource::Pattern,
-                    rule_id: rule_id.to_string(),
-                    file_uri: incident.file_uri.clone(),
-                    line,
-                    description: format!(
-                        "Remove prop '{}' (unbalanced brackets, manual)",
-                        prop_name
-                    ),
-                });
+                report.record_skip(rule_id, &incident.file_uri, Some(line),
+                    SkipReason::UnbalancedBrackets,
+                    Some(format!("prop '{}' spans multiple lines with unbalanced brackets", prop_name)));
+                return None;
             }
 
             // Remove all lines from prop start through closing bracket
@@ -546,15 +564,10 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
 
         if let Some(m) = prop_re.find(file_line) {
             if bracket_depth(m.as_str()) != 0 {
-                return Some(PlannedFix {
-                    edits: vec![],
-                    confidence: FixConfidence::Low,
-                    source: FixSource::Pattern,
-                    rule_id: rule_id.to_string(),
-                    file_uri: incident.file_uri.clone(),
-                    line,
-                    description: format!("Remove prop '{}' (multi-line inline, manual)", prop_name),
-                });
+                report.record_skip(rule_id, &incident.file_uri, Some(line),
+                    SkipReason::UnbalancedBrackets,
+                    Some(format!("prop '{}' inline value has unbalanced brackets", prop_name)));
+                return None;
             }
 
             Some(PlannedFix {
@@ -574,15 +587,10 @@ fn plan_remove_prop(rule_id: &str, incident: &Incident, file_path: &Path) -> Opt
                 description: format!("Remove prop '{}'", prop_name),
             })
         } else {
-            Some(PlannedFix {
-                edits: vec![],
-                confidence: FixConfidence::Low,
-                source: FixSource::Pattern,
-                rule_id: rule_id.to_string(),
-                file_uri: incident.file_uri.clone(),
-                line,
-                description: format!("Remove prop '{}' (manual)", prop_name),
-            })
+            report.record_skip(rule_id, &incident.file_uri, Some(line),
+                SkipReason::TextNotFound,
+                Some(format!("prop '{}' not matched by removal regex on line {}", prop_name, line)));
+            None
         }
     }
 }
@@ -733,6 +741,7 @@ fn plan_ensure_npm_dependency(
     package: &str,
     new_version: &str,
     file_path: &Path,
+    _report: &mut FixReport,
 ) -> Vec<PlannedFix> {
     // ── Path 1: Lockfile incident ────────────────────────────────────
     //
@@ -1647,12 +1656,14 @@ mod tests {
         // Call the function — it will try to query npm for react-topology.
         // In CI without network, the npm query may fail, but the function
         // should gracefully return None rather than panic.
+        let mut report = FixReport::new();
         let result = plan_ensure_npm_dependency(
             "semver-dep-update-patternfly-react-core",
             &incident,
             "@patternfly/react-core",
             "^6.4.1",
             &pkg_json,
+            &mut report,
         );
 
         // If npm is reachable, we get a fix targeting react-topology (not react-core).
@@ -1690,12 +1701,14 @@ mod tests {
         let vars = BTreeMap::new();
         let incident = make_test_incident(&format!("file://{}", pkg_json.display()), 3, vars);
 
+        let mut report = FixReport::new();
         let result = plan_ensure_npm_dependency(
             "semver-dep-update-patternfly-react-core",
             &incident,
             "@patternfly/react-core",
             "^6.4.1",
             &pkg_json,
+            &mut report,
         );
 
         assert_eq!(

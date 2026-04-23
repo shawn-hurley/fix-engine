@@ -32,6 +32,7 @@ pub fn plan_fixes(
     project_root: &std::path::Path,
     strategies: &BTreeMap<String, FixStrategy>,
     lang: &dyn LanguageFixProvider,
+    report: &mut FixReport,
 ) -> Result<FixPlan> {
     let mut plan = FixPlan::default();
 
@@ -56,7 +57,7 @@ pub fn plan_fixes(
                 match &strategy {
                     FixStrategy::Rename(mappings) => {
                         if let Some(mut fix) =
-                            plan_rename(rule_id, incident, mappings, &file_path, lang)
+                            plan_rename(rule_id, incident, mappings, &file_path, lang, report)
                         {
                             // Import renames: the old name appears in both the
                             // import specifier AND the module path (e.g.,
@@ -71,14 +72,14 @@ pub fn plan_fixes(
                         }
                     }
                     FixStrategy::RemoveAttribute => {
-                        if let Some(fix) = lang.plan_remove_attribute(rule_id, incident, &file_path)
+                        if let Some(fix) = lang.plan_remove_attribute(rule_id, incident, &file_path, report)
                         {
                             plan.files.entry(file_path).or_default().push(fix);
                         }
                     }
                     FixStrategy::ImportPathChange { old_path, new_path } => {
                         if let Some(fix) = plan_import_path_change(
-                            rule_id, incident, old_path, new_path, &file_path,
+                            rule_id, incident, old_path, new_path, &file_path, report,
                         ) {
                             plan.files.entry(file_path).or_default().push(fix);
                         }
@@ -133,7 +134,7 @@ pub fn plan_fixes(
                             new: new_prefix.clone(),
                         }];
                         if let Some(mut fix) =
-                            plan_rename(rule_id, incident, &mappings, &file_path, lang)
+                            plan_rename(rule_id, incident, &mappings, &file_path, lang, report)
                         {
                             // CSS prefix edits should replace ALL occurrences on a line,
                             // e.g. className="pf-v5-u-color-200 pf-v5-u-font-weight-light"
@@ -157,6 +158,7 @@ pub fn plan_fixes(
                             package,
                             new_version,
                             &file_path,
+                            report,
                         );
                         for fix in fixes {
                             let dep_file = fix.file_uri.clone();
@@ -825,7 +827,15 @@ pub fn apply_fixes(
                             actual_line = %line,
                             "Edit skipped: old_text not found on line"
                         );
-                        result.edits_skipped += 1;
+                        result.failed_edits.push(FailedEdit {
+                            file: file_path.clone(),
+                            line: edit.line,
+                            rule_id: edit.rule_id.clone(),
+                            old_text: edit.old_text.clone(),
+                            reason: FailedEditReason::TextNotFoundOnLine {
+                                actual_line: line.to_string(),
+                            },
+                        });
                     }
                 } else {
                     tracing::debug!(
@@ -836,7 +846,15 @@ pub fn apply_fixes(
                         total_lines = lines.len(),
                         "Edit skipped: line index out of bounds"
                     );
-                    result.edits_skipped += 1;
+                    result.failed_edits.push(FailedEdit {
+                        file: file_path.clone(),
+                        line: edit.line,
+                        rule_id: edit.rule_id.clone(),
+                        old_text: edit.old_text.clone(),
+                        reason: FailedEditReason::LineOutOfBounds {
+                            total_lines: lines.len(),
+                        },
+                    });
                 }
             }
         }
@@ -953,14 +971,33 @@ fn plan_rename(
     mappings: &[RenameMapping],
     file_path: &PathBuf,
     lang: &dyn LanguageFixProvider,
+    report: &mut FixReport,
 ) -> Option<PlannedFix> {
-    let line = incident.line_number?;
+    let line = match incident.line_number {
+        Some(l) => l,
+        None => {
+            report.record_skip(rule_id, &incident.file_uri, None, SkipReason::NoLineNumber, None);
+            return None;
+        }
+    };
 
     let matched_text = lang.get_matched_text_for_rename(incident, mappings);
     let is_whole_file_rename = lang.is_whole_file_rename(incident);
     let primary_mapping = mappings.iter().find(|m| m.old == matched_text);
 
-    let source = std::fs::read_to_string(file_path).ok()?;
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(e) => {
+            report.record_skip(
+                rule_id,
+                &incident.file_uri,
+                Some(line),
+                SkipReason::FileUnreadable,
+                Some(e.to_string()),
+            );
+            return None;
+        }
+    };
     let mut edits = Vec::new();
 
     if is_whole_file_rename {
@@ -992,6 +1029,7 @@ fn plan_rename(
         }
     } else if let Some(mapping) = primary_mapping {
         if mapping.old == mapping.new {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::NoOpRename, None);
             return None;
         }
         edits.push(TextEdit {
@@ -1051,6 +1089,13 @@ fn plan_rename(
     }
 
     if edits.is_empty() {
+        report.record_skip(
+            rule_id,
+            &incident.file_uri,
+            Some(line),
+            SkipReason::TextNotFound,
+            Some(format!("none of the rename mappings matched text on line {}", line)),
+        );
         return None;
     }
 
@@ -1077,13 +1122,33 @@ fn plan_import_path_change(
     old_path: &str,
     new_path: &str,
     file_path: &PathBuf,
+    report: &mut FixReport,
 ) -> Option<PlannedFix> {
-    let line = incident.line_number?;
+    let line = match incident.line_number {
+        Some(l) => l,
+        None => {
+            report.record_skip(rule_id, &incident.file_uri, None, SkipReason::NoLineNumber, None);
+            return None;
+        }
+    };
 
-    let source = std::fs::read_to_string(file_path).ok()?;
+    let source = match std::fs::read_to_string(file_path) {
+        Ok(s) => s,
+        Err(e) => {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::FileUnreadable, Some(e.to_string()));
+            return None;
+        }
+    };
     let lines: Vec<&str> = source.lines().collect();
     let idx = (line as usize).saturating_sub(1);
-    let file_line = lines.get(idx)?;
+    let file_line = match lines.get(idx) {
+        Some(l) => l,
+        None => {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::LineOutOfBounds,
+                Some(format!("file has {} lines", lines.len())));
+            return None;
+        }
+    };
 
     // Determine which line contains the import path to rewrite.
     //
@@ -1105,6 +1170,7 @@ fn plan_import_path_change(
         // Guard against double-application: if new_path is already present
         // (e.g. old_path is a prefix of new_path), skip.
         if file_line.contains(new_path) {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::AlreadyMigrated, None);
             return None;
         }
         line
@@ -1118,23 +1184,34 @@ fn plan_import_path_change(
                 || l.trim_start().starts_with("export")
         });
         if !in_import_block {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::NotInImportBlock, None);
             return None;
         }
 
         // Scan forward from the incident line for the `from` clause.
-        let from_idx = (idx..lines.len()).take(50).find(|&i| {
+        let from_idx = match (idx..lines.len()).take(50).find(|&i| {
             let trimmed = lines[i].trim_start();
             trimmed.starts_with("} from ")
                 || trimmed.starts_with("from ")
                 || (trimmed.contains(" from '") || trimmed.contains(" from \""))
-        })?;
+        }) {
+            Some(i) => i,
+            None => {
+                report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::TextNotFound,
+                    Some("could not find 'from' clause in import block".to_string()));
+                return None;
+            }
+        };
 
         let from_line = lines[from_idx];
         if !from_line.contains(old_path) {
-            return None; // Not our import
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::TextNotFound,
+                Some(format!("from clause does not contain '{}'", old_path)));
+            return None;
         }
         // Guard against double-application on the from-line.
         if from_line.contains(new_path) {
+            report.record_skip(rule_id, &incident.file_uri, Some(line), SkipReason::AlreadyMigrated, None);
             return None;
         }
 
@@ -1367,6 +1444,7 @@ mod tests {
             "@patternfly/react-charts",
             "@patternfly/react-charts/victory",
             &file,
+            &mut FixReport::new(),
         );
 
         let fix = fix.expect("should produce a fix for single-line import");
@@ -1402,6 +1480,7 @@ import { Button } from '@patternfly/react-core';
             "@patternfly/react-charts",
             "@patternfly/react-charts/victory",
             &file,
+            &mut FixReport::new(),
         );
 
         let fix = fix.expect("should produce a fix for multi-line import");
@@ -1438,6 +1517,7 @@ import {
             "@patternfly/react-charts",
             "@patternfly/react-charts/victory",
             &file,
+            &mut FixReport::new(),
         );
 
         let fix = fix.expect("should produce a fix for any specifier in multi-line import");
@@ -1461,6 +1541,7 @@ import {
             "@patternfly/react-charts",
             "@patternfly/react-charts/victory",
             &file,
+            &mut FixReport::new(),
         );
 
         assert!(fix.is_none(), "should skip already-migrated imports");
@@ -1488,6 +1569,7 @@ import {
             "@patternfly/react-charts",
             "@patternfly/react-charts/victory",
             &file,
+            &mut FixReport::new(),
         );
 
         assert!(
@@ -1520,6 +1602,7 @@ function App() {
             "@patternfly/react-charts",
             "@patternfly/react-charts/victory",
             &file,
+            &mut FixReport::new(),
         );
 
         // The backward scan WILL find `import` on line 1 and `{` on line 3
@@ -1558,6 +1641,7 @@ export {
             "@patternfly/react-charts",
             "@patternfly/react-charts/victory",
             &file,
+            &mut FixReport::new(),
         );
 
         let fix = fix.expect("should handle export re-exports");

@@ -13,4 +13,5 @@ pub mod engine;
 pub mod goose_client;
 pub mod language;
 pub mod llm_client;
+pub mod progress;
 pub mod registry;

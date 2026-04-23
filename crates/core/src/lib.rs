@@ -112,14 +112,177 @@ pub struct FixResult {
     pub files_modified: usize,
     /// Number of edits applied.
     pub edits_applied: usize,
-    /// Number of edits skipped (line out of bounds or text not found).
-    pub edits_skipped: usize,
     /// Number of edits subsumed by a more specific edit on the same line.
     pub edits_subsumed: usize,
-    /// Errors encountered.
+    /// Edits that were planned but could not be applied.
+    pub failed_edits: Vec<FailedEdit>,
+    /// Non-fatal errors (e.g., file unreadable at apply time).
     pub errors: Vec<String>,
     /// Paths of files that were actually modified on disk.
     pub modified_files: Vec<std::path::PathBuf>,
+}
+
+// ── Fix Report ──────────────────────────────────────────────────────────
+
+/// Accumulates the outcome of every incident processed by the fix engine.
+///
+/// Created at the start of a run and threaded through planning, applying,
+/// and LLM fix phases. Used at the end to produce a human-readable or
+/// JSON summary of what happened to every incident.
+#[derive(Debug, Default, Serialize)]
+pub struct FixReport {
+    /// Incidents where no fix could be generated during planning.
+    pub skipped: Vec<SkippedIncident>,
+    /// Non-fatal warnings (strategy load failures, post-apply issues, etc.)
+    pub warnings: Vec<FixWarning>,
+}
+
+impl FixReport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an incident that was skipped during planning.
+    pub fn record_skip(
+        &mut self,
+        rule_id: &str,
+        file: &str,
+        line: Option<u32>,
+        reason: SkipReason,
+        detail: Option<String>,
+    ) {
+        self.skipped.push(SkippedIncident {
+            rule_id: rule_id.to_string(),
+            file: file.to_string(),
+            line,
+            reason,
+            detail,
+        });
+    }
+
+    /// Record a non-fatal warning.
+    pub fn warn(&mut self, phase: &'static str, message: String) {
+        self.warnings.push(FixWarning { phase, message });
+    }
+}
+
+/// An incident where no fix could be generated.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedIncident {
+    pub rule_id: String,
+    pub file: String,
+    pub line: Option<u32>,
+    pub reason: SkipReason,
+    /// Extra context (e.g., "expected 'Chip' on line 42, found '...'").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Why an incident could not be fixed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    // ── Planning failures ────────────────────────────────────
+    /// Source file could not be read at plan time.
+    FileUnreadable,
+    /// Incident has no line number.
+    NoLineNumber,
+    /// Expected text not found on the target line.
+    TextNotFound,
+    /// Target line number exceeds the file's line count.
+    LineOutOfBounds,
+    /// The migration has already been applied (idempotency).
+    AlreadyMigrated,
+    /// Bracket scanning could not find a matching close bracket.
+    UnbalancedBrackets,
+    /// Required incident variable (e.g., propName) is missing.
+    MissingVariable,
+    /// Rename mapping old == new (no-op).
+    NoOpRename,
+    /// Import line does not contain the expected from clause.
+    NotInImportBlock,
+    // ── LLM / Goose failures ─────────────────────────────────
+    /// LLM responded but produced no fix blocks.
+    EmptyLlmResponse,
+    /// LLM request failed (network, auth, etc.).
+    LlmError,
+    /// Goose subprocess timed out.
+    GooseTimeout,
+    /// Goose subprocess exited with an error.
+    GooseFailed,
+    /// Goose returned an empty response.
+    GooseEmptyResponse,
+    // ── Dependency resolution ────────────────────────────────
+    /// No compatible version found on npm registry.
+    NoCompatibleVersion,
+    /// Could not find package.json for the project.
+    PackageJsonNotFound,
+    /// Dependency version is already compatible.
+    VersionAlreadyCompatible,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FileUnreadable => write!(f, "file unreadable"),
+            Self::NoLineNumber => write!(f, "no line number"),
+            Self::TextNotFound => write!(f, "text not found"),
+            Self::LineOutOfBounds => write!(f, "line out of bounds"),
+            Self::AlreadyMigrated => write!(f, "already migrated"),
+            Self::UnbalancedBrackets => write!(f, "unbalanced brackets"),
+            Self::MissingVariable => write!(f, "missing variable"),
+            Self::NoOpRename => write!(f, "no-op rename"),
+            Self::NotInImportBlock => write!(f, "not in import block"),
+            Self::EmptyLlmResponse => write!(f, "empty LLM response"),
+            Self::LlmError => write!(f, "LLM error"),
+            Self::GooseTimeout => write!(f, "goose timeout"),
+            Self::GooseFailed => write!(f, "goose failed"),
+            Self::GooseEmptyResponse => write!(f, "goose empty response"),
+            Self::NoCompatibleVersion => write!(f, "no compatible version"),
+            Self::PackageJsonNotFound => write!(f, "package.json not found"),
+            Self::VersionAlreadyCompatible => write!(f, "version already compatible"),
+        }
+    }
+}
+
+/// An edit that was planned but could not be applied.
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedEdit {
+    pub file: PathBuf,
+    pub line: u32,
+    pub rule_id: String,
+    pub old_text: String,
+    pub reason: FailedEditReason,
+}
+
+/// Why an edit could not be applied at write time.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailedEditReason {
+    /// The expected old_text was not found on the target line.
+    TextNotFoundOnLine { actual_line: String },
+    /// The target line exceeds the file's line count.
+    LineOutOfBounds { total_lines: usize },
+}
+
+impl std::fmt::Display for FailedEditReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TextNotFoundOnLine { actual_line } => {
+                write!(f, "text not found (actual: {:?})", actual_line)
+            }
+            Self::LineOutOfBounds { total_lines } => {
+                write!(f, "line out of bounds (file has {} lines)", total_lines)
+            }
+        }
+    }
+}
+
+/// A non-fatal warning from any phase of the fix pipeline.
+#[derive(Debug, Clone, Serialize)]
+pub struct FixWarning {
+    pub phase: &'static str,
+    pub message: String,
 }
 
 /// A rename mapping: old name -> new name.
@@ -490,21 +653,6 @@ pub fn load_strategies_and_families(
     Ok((strategies, families))
 }
 
-/// Load fix strategies from a JSON file.
-///
-/// Returns a map of rule_id -> FixStrategy.
-pub fn load_strategies_from_json(
-    path: &Path,
-) -> Result<BTreeMap<String, FixStrategy>, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let entries: BTreeMap<String, FixStrategyEntry> = serde_json::from_str(&content)?;
-    let strategies = entries
-        .iter()
-        .map(|(rule_id, entry)| (rule_id.clone(), strategy_entry_to_fix_strategy(entry)))
-        .collect();
-    Ok(strategies)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,7 +852,7 @@ mod tests {
         let result = FixResult::default();
         assert_eq!(result.files_modified, 0);
         assert_eq!(result.edits_applied, 0);
-        assert_eq!(result.edits_skipped, 0);
+        assert!(result.failed_edits.is_empty());
         assert!(result.errors.is_empty());
     }
 

@@ -26,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +35,10 @@ yaml_serde = "0.10"
 
 # Error handling
 anyhow = "1"
+
+# Progress & terminal output
+indicatif = "0.17"
+owo-colors = { version = "4", features = ["supports-colors"] }
 
 # Logging
 tracing = "0.1"

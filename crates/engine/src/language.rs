@@ -9,7 +9,7 @@
 //! crates implement, plus a [`NoOpLanguageFixProvider`] fallback that performs
 //! no language-specific processing.
 
-use fix_engine_core::{PlannedFix, RenameMapping};
+use fix_engine_core::{FixReport, PlannedFix, RenameMapping};
 use konveyor_core::incident::Incident;
 use std::path::Path;
 
@@ -43,6 +43,7 @@ pub trait LanguageFixProvider: Send + Sync {
         rule_id: &str,
         incident: &Incident,
         file_path: &Path,
+        report: &mut FixReport,
     ) -> Option<PlannedFix>;
 
     /// Plan dependency version fix(es).
@@ -63,6 +64,7 @@ pub trait LanguageFixProvider: Send + Sync {
         package: &str,
         new_version: &str,
         file_path: &Path,
+        report: &mut FixReport,
     ) -> Vec<PlannedFix>;
 
     /// Extract the matched text from incident variables.
@@ -148,6 +150,7 @@ impl LanguageFixProvider for NoOpLanguageFixProvider {
         _rule_id: &str,
         _incident: &Incident,
         _file_path: &Path,
+        _report: &mut FixReport,
     ) -> Option<PlannedFix> {
         None
     }
@@ -159,6 +162,7 @@ impl LanguageFixProvider for NoOpLanguageFixProvider {
         _package: &str,
         _new_version: &str,
         _file_path: &Path,
+        _report: &mut FixReport,
     ) -> Vec<PlannedFix> {
         Vec::new()
     }
@@ -214,8 +218,9 @@ mod tests {
             links: Vec::new(),
             is_dependency_incident: false,
         };
+        let mut report = fix_engine_core::FixReport::new();
         assert!(provider
-            .plan_remove_attribute("rule", &incident, Path::new("/test.rs"))
+            .plan_remove_attribute("rule", &incident, Path::new("/test.rs"), &mut report)
             .is_none());
     }
 
@@ -233,8 +238,9 @@ mod tests {
             links: Vec::new(),
             is_dependency_incident: false,
         };
+        let mut report = fix_engine_core::FixReport::new();
         assert!(provider
-            .plan_ensure_dependency("rule", &incident, "pkg", "1.0.0", Path::new("/test.rs"))
+            .plan_ensure_dependency("rule", &incident, "pkg", "1.0.0", Path::new("/test.rs"), &mut report)
             .is_empty());
     }
 
