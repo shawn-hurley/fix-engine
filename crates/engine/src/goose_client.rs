@@ -13,6 +13,8 @@ use std::process::Command;
 use std::time::Duration;
 
 #[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
 /// Result of a goose fix attempt.
@@ -34,6 +36,12 @@ fn run_goose_with_timeout(
     max_turns: &str,
     timeout_secs: u64,
 ) -> Result<(bool, String, String)> {
+    #[cfg(unix)]
+    let pty = nix::pty::openpty(None, None)
+        .context("Failed to allocate PTY for goose subprocess")?;
+    #[cfg(unix)]
+    let slave_fd = pty.slave.as_raw_fd();
+
     let mut cmd = Command::new("goose");
     cmd.args([
         "run",
@@ -52,15 +60,30 @@ fn run_goose_with_timeout(
     .stderr(std::process::Stdio::piped())
     .stdin(std::process::Stdio::null());
 
-    // Isolate goose in its own process group so that signals sent by
-    // goose's child processes (e.g., claude-code) cannot propagate to
-    // our parent process.
+    // Give goose its own session with a PTY as its controlling terminal.
+    // This prevents SIGTTIN when goose or its children (e.g., claude-code)
+    // open /dev/tty. The new session also isolates the process group so
+    // signals cannot propagate to our parent process.
     #[cfg(unix)]
-    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
     let mut child = cmd
         .spawn()
         .context("Failed to execute goose. Is it installed and in PATH?")?;
+
+    // Close slave in parent; the child inherited its own copy after fork.
+    #[cfg(unix)]
+    drop(pty.slave);
 
     let timeout = Duration::from_secs(timeout_secs);
     let start = std::time::Instant::now();
