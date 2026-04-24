@@ -85,6 +85,27 @@ fn run_goose_with_timeout(
     #[cfg(unix)]
     drop(pty.slave);
 
+    // Drain stdout and stderr in background threads to prevent the child
+    // from blocking on a full pipe buffer (typically 64KB on Linux).
+    // Without this, the child's write() blocks when the buffer is full
+    // and the parent's try_wait() blocks waiting for exit — deadlock.
+    let stdout_handle = child.stdout.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = pipe;
+            std::io::Read::read_to_string(&mut reader, &mut buf).ok();
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = pipe;
+            std::io::Read::read_to_string(&mut reader, &mut buf).ok();
+            buf
+        })
+    });
+
     let timeout = Duration::from_secs(timeout_secs);
     let start = std::time::Instant::now();
 
@@ -92,23 +113,11 @@ fn run_goose_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Process exited — stdout is JSON with full message history
-                let raw_json = child
-                    .stdout
-                    .take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                        buf
-                    })
+                let raw_json = stdout_handle
+                    .map(|h| h.join().unwrap_or_default())
                     .unwrap_or_default();
-                let _stderr = child
-                    .stderr
-                    .take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
-                        buf
-                    })
+                let _stderr = stderr_handle
+                    .map(|h| h.join().unwrap_or_default())
                     .unwrap_or_default();
 
                 // Extract the text response from the JSON output.
