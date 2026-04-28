@@ -22,6 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # Utilities
 regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Progress reporting
 indicatif = "0.17"

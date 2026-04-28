@@ -835,14 +835,8 @@ pub fn generate_test_fix_requests(requests: &[LlmFixRequest]) -> Vec<LlmFixReque
                  Instructions:\n\
                  1. Read this test file at {test_path}\n\
                  2. Read the component file at {component_path} to see the current (already migrated) code\n\
-                 3. For each test that interacts with the migrated component:\n\
-                    - If the test opens a dropdown/menu/popover and queries for content using \
-                      getByText/getByRole/findByText: the content now renders via portal to \
-                      document.body. Wrap assertions in waitFor() or add \
-                      popperProps={{{{ appendTo: 'inline' }}}} to the component render in the test.\n\
-                    - If the test uses querySelector with data attributes that changed \
-                      (e.g., OUIA selectors with PF5 prefix): update to the new attribute values.\n\
-                    - If the test uses getByRole with roles that changed: update the role queries.\n\
+                 3. For each test that interacts with the migrated component, check whether \
+                    the changes described above would cause the test to fail. If so, fix the test.\n\
                  4. Write the fixed test file",
                 component_file = component_file_name,
                 original_message = req.message,

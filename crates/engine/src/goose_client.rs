@@ -329,18 +329,37 @@ pub fn run_all_goose_fixes(
     timeout_secs: u64,
     max_families_per_chunk: usize,
 ) -> Vec<GooseFixResult> {
-    // Create log directory if specified, removing stale logs from
-    // previous runs. Without cleanup, errored files (which previously
-    // didn't write logs) would leave behind stale entries from prior
-    // runs at the same index, making failure diagnosis misleading.
+    // Create log directory if specified, archiving logs from previous
+    // runs into a timestamped subdirectory. Without cleanup, errored
+    // files (which previously didn't write logs) would leave behind
+    // stale entries from prior runs at the same index, making failure
+    // diagnosis misleading.
     if let Some(dir) = log_dir {
         let _ = std::fs::create_dir_all(dir);
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                    let _ = std::fs::remove_file(path);
+        // Collect existing JSON files (goose-fix-NNN.json, timeouts.json, etc.)
+        let existing_json: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    Some(p)
+                } else {
+                    None
                 }
+            })
+            .collect();
+        if !existing_json.is_empty() {
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let archive_dir = dir.join(format!("previous-{}", ts));
+            if std::fs::create_dir_all(&archive_dir).is_ok() {
+                for path in &existing_json {
+                    if let Some(name) = path.file_name() {
+                        let _ = std::fs::rename(path, archive_dir.join(name));
+                    }
+                }
+                tracing::info!("Archived {} logs from previous run to {}", existing_json.len(), archive_dir.display());
             }
         }
     }
@@ -1058,14 +1077,8 @@ fn format_companion_test_files_section(test_files: &[PathBuf]) -> String {
 
     format!(
         "\nCompanion test files — you MUST read these after applying fixes:\n{}\n\
-         After fixing the main file, read each test file above and check if any test:\n\
-         - Opens a dropdown/menu/popover and queries for content (getByText, getByRole)\n\
-         - Uses querySelector with OUIA selectors to interact with components\n\
-         - Asserts on element roles, aria attributes, or data attributes that changed\n\
-         If any test would break due to your changes, fix it. Common test fixes:\n\
-         - Wrap assertions in waitFor() when content renders via portal\n\
-         - Add popperProps={{{{ appendTo: 'inline' }}}} to component renders in tests\n\
-         - Update getByRole/getByText queries to match new attribute values\n",
+         After fixing the main file, read each test file above and check if any \
+         test would break due to your changes. If a test would break, fix it.\n",
         file_list.join("\n"),
     )
 }
@@ -1123,7 +1136,7 @@ Instructions:
 3. Make the minimum edit necessary — do not change unrelated code, but DO clean up any artifacts caused by your change (e.g., remove imports that are no longer referenced, delete dead declarations)
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
 5. Write the fixed file
-6. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures (e.g., portal rendering means getByText/getByRole won't find dropdown content, renamed attributes break selectors). If a test would break, apply the fix and write the updated test file.
+6. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 
 Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it.
@@ -1310,7 +1323,7 @@ Instructions:
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
 5. Do NOT revert any changes that were already applied in previous passes
 6. Write the fixed file once with ALL changes from every fix applied
-7. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures (e.g., portal rendering means getByText/getByRole won't find dropdown content, renamed attributes break selectors). If a test would break, apply the fix and write the updated test file.
+7. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 {verification_section}
 Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it.

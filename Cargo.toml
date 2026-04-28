@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/engine", "crates/js-fix"]
+members = ["crates/core", "crates/engine", "crates/js-fix", "crates/java-fix"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -19,6 +19,7 @@ license = "Apache-2.0"
 fix-engine-core = { version = "0.0.2", path = "crates/core" }
 fix-engine = { version = "0.0.2", path = "crates/engine" }
 fix-engine-js-fix = { version = "0.0.2", path = "crates/js-fix" }
+fix-engine-java-fix = { version = "0.0.2", path = "crates/java-fix" }
 konveyor-core = { workspace = true }
 
 # Async runtime
