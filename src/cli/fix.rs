@@ -226,6 +226,18 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
         consolidated_count = before_count - plan.pending_llm.len();
     }
 
+    // Generate dedicated test-fix requests for companion test files.
+    // These are separate Goose sessions that focus entirely on fixing
+    // tests broken by component migration changes.
+    let test_fix_requests = engine::generate_test_fix_requests(&plan.pending_llm);
+    if !test_fix_requests.is_empty() {
+        progress.println(&format!(
+            "  {} dedicated test-fix requests generated",
+            test_fix_requests.len(),
+        ));
+        plan.pending_llm.extend(test_fix_requests);
+    }
+
     let pattern_fix_count: usize = plan
         .files
         .values()
@@ -362,12 +374,17 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                         by_file.into_values().collect::<Vec<_>>()
                     }) {
                         if !result.success {
+                            let reason = if result.timed_out {
+                                fix_engine_core::SkipReason::GooseTimeout
+                            } else {
+                                fix_engine_core::SkipReason::GooseFailed
+                            };
                             for req in requests {
                                 report.record_skip(
                                     &req.rule_id,
                                     &req.file_uri,
                                     Some(req.line),
-                                    fix_engine_core::SkipReason::GooseFailed,
+                                    reason.clone(),
                                     None,
                                 );
                                 plan.manual.push(fix_engine_core::ManualFixItem {

@@ -86,6 +86,10 @@ impl LanguageFixProvider for JsFixProvider {
         incident.variables.contains_key("importedName")
     }
 
+    fn discover_companion_test_files(&self, file_path: &Path) -> Vec<PathBuf> {
+        discover_js_companion_test_files(file_path)
+    }
+
     fn pre_apply(&self, project_root: &Path) -> Option<Box<dyn std::any::Any>> {
         // For yarn projects, capture the baseline set of unmet peer dep names
         // BEFORE any edits are written. This lets post_apply diff against the
@@ -440,6 +444,132 @@ fn run_npm_install(project_root: &Path) {
             tracing::warn!("npm install could not be executed: {}", e);
         }
     }
+}
+
+// -- Companion test file discovery --
+
+/// Discover companion test files for a JS/TS component source file.
+///
+/// Searches for test files using common JS/TS conventions:
+/// 1. `__tests__/` directory in the same directory as the component
+/// 2. Sibling test files (e.g., `Component.test.tsx` next to `Component.tsx`)
+///
+/// Test files are matched by checking if their name contains the component's
+/// filename stem (case-insensitive). For example, for `viewLayoutToolbar.tsx`:
+/// - `__tests__/viewLayoutToolbar.test.tsx` — matches
+/// - `__tests__/viewLayoutToolbarInteractions.test.tsx` — matches
+/// - `__tests__/otherComponent.test.tsx` — does NOT match
+fn discover_js_companion_test_files(file_path: &Path) -> Vec<PathBuf> {
+    let mut test_files = Vec::new();
+
+    let stem = match file_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s.to_string(),
+        None => return test_files,
+    };
+
+    let parent = match file_path.parent() {
+        Some(p) => p,
+        None => return test_files,
+    };
+
+    let stem_lower = stem.to_lowercase();
+
+    // Test file extension patterns
+    let test_extensions = [
+        ".test.ts",
+        ".test.tsx",
+        ".test.js",
+        ".test.jsx",
+        ".spec.ts",
+        ".spec.tsx",
+        ".spec.js",
+        ".spec.jsx",
+    ];
+
+    // 1. Check __tests__/ directory
+    let tests_dir = parent.join("__tests__");
+    if tests_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&tests_dir) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if !entry_path.is_file() {
+                    continue;
+                }
+                let filename = match entry_path.file_name().and_then(|f| f.to_str()) {
+                    Some(f) => f.to_string(),
+                    None => continue,
+                };
+
+                // Check if it's a test file that matches our component name
+                let is_test = test_extensions
+                    .iter()
+                    .any(|ext| filename.ends_with(ext));
+                if !is_test {
+                    continue;
+                }
+
+                // Extract the base name (before .test.tsx etc.)
+                let base = filename
+                    .split(".test.")
+                    .next()
+                    .or_else(|| filename.split(".spec.").next())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                // Match if the base name starts with the component stem
+                if base.starts_with(&stem_lower) {
+                    test_files.push(entry_path);
+                }
+            }
+        }
+    }
+
+    // 2. Check sibling test files (e.g., Component.test.tsx next to Component.tsx)
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if !entry_path.is_file() {
+                continue;
+            }
+            let filename = match entry_path.file_name().and_then(|f| f.to_str()) {
+                Some(f) => f.to_string(),
+                None => continue,
+            };
+
+            let is_test = test_extensions
+                .iter()
+                .any(|ext| filename.ends_with(ext));
+            if !is_test {
+                continue;
+            }
+
+            let base = filename
+                .split(".test.")
+                .next()
+                .or_else(|| filename.split(".spec.").next())
+                .unwrap_or("")
+                .to_lowercase();
+
+            if base.starts_with(&stem_lower) {
+                test_files.push(entry_path);
+            }
+        }
+    }
+
+    // Sort for deterministic output
+    test_files.sort();
+    test_files.dedup();
+
+    if !test_files.is_empty() {
+        tracing::debug!(
+            component = %file_path.display(),
+            count = test_files.len(),
+            files = ?test_files,
+            "Discovered companion test files"
+        );
+    }
+
+    test_files
 }
 
 // -- JSX prop removal --

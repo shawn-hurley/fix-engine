@@ -24,6 +24,9 @@ pub struct GooseFixResult {
     pub rule_id: String,
     pub success: bool,
     pub output: String,
+    /// True when the failure was specifically a timeout (distinguishes
+    /// from other errors like spawn failures or non-zero exit codes).
+    pub timed_out: bool,
 }
 
 /// Run a goose command with a timeout. Returns the combined stdout+stderr
@@ -180,6 +183,8 @@ struct MergedLlmFixRequest {
     /// Component family (e.g., "Modal", "Select") extracted from labels.
     /// Used to group related rules in the batch prompt.
     family: Option<String>,
+    /// Companion test files discovered near the component file.
+    companion_test_files: Vec<PathBuf>,
 }
 
 /// Merge LLM fix requests by rule_id, preserving insertion order.
@@ -218,6 +223,7 @@ fn merge_by_rule_id(requests: &[&LlmFixRequest]) -> Vec<MergedLlmFixRequest> {
                 message: req.message.clone(),
                 code_snips,
                 family,
+                companion_test_files: req.companion_test_files.clone(),
             });
         }
     }
@@ -323,9 +329,20 @@ pub fn run_all_goose_fixes(
     timeout_secs: u64,
     max_families_per_chunk: usize,
 ) -> Vec<GooseFixResult> {
-    // Create log directory if specified
+    // Create log directory if specified, removing stale logs from
+    // previous runs. Without cleanup, errored files (which previously
+    // didn't write logs) would leave behind stale entries from prior
+    // runs at the same index, making failure diagnosis misleading.
     if let Some(dir) = log_dir {
         let _ = std::fs::create_dir_all(dir);
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
 
     // Group by file path for batching
@@ -529,6 +546,7 @@ fn process_single_file(
         rule_id: String::new(),
         success: true,
         output: String::new(),
+        timed_out: false,
     });
     let mut all_prompts = Vec::new();
     let mut all_outputs: Vec<String> = Vec::new();
@@ -563,6 +581,7 @@ fn process_single_file(
                     rule_id: file_requests[0].rule_id.clone(),
                     success,
                     output,
+                    timed_out: false,
                 });
             }
             Err(e) => {
@@ -807,6 +826,7 @@ fn process_single_file(
                             .join(", "),
                         success,
                         output,
+                        timed_out: false,
                     });
                     if !success {
                         log.push(format!(
@@ -864,6 +884,7 @@ fn process_single_file(
                                         .join(", "),
                                     success,
                                     output,
+                                    timed_out: false,
                                 });
                             }
                             Err(e2) => {
@@ -950,12 +971,59 @@ fn process_single_file(
             (r, log)
         }
         Err(e) => {
+            let err_msg = format!("{}", e);
+            let is_timeout = err_msg.contains("timed out");
+            let label = if is_timeout { "TIMEOUT" } else { "ERROR" };
             log.push(format!(
-                "         {}: ERROR ({:.1}s) — {}",
+                "         {}: {} ({:.1}s) — {}",
                 file_name,
+                label,
                 elapsed.as_secs_f64(),
-                e
+                err_msg
             ));
+
+            // Write a log file even on error so failures are debuggable.
+            // Previous runs left no trace when goose timed out or crashed,
+            // making it impossible to diagnose which files failed and why.
+            if let Some(dir) = log_dir {
+                let chunks: Vec<serde_json::Value> = all_prompts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, prompt)| {
+                        let resp = all_outputs.get(i).unwrap_or(&String::new()).clone();
+                        let raw_json = all_stderrs.get(i).unwrap_or(&String::new()).clone();
+                        let goose_session: serde_json::Value = serde_json::from_str(&raw_json)
+                            .unwrap_or_else(|_| serde_json::json!({"raw": raw_json}));
+                        serde_json::json!({
+                            "chunk": i + 1,
+                            "prompt": prompt,
+                            "response": resp,
+                            "response_length": resp.len(),
+                            "elapsed_secs": chunk_times.get(i).unwrap_or(&0.0),
+                            "retried": chunk_retried.get(i).unwrap_or(&false),
+                            "status": "error",
+                            "goose_session": goose_session,
+                        })
+                    })
+                    .collect();
+
+                let log_entry = serde_json::json!({
+                    "file": file_path.display().to_string(),
+                    "rule_ids": file_requests.iter().map(|r| &r.rule_id).collect::<Vec<_>>(),
+                    "chunks": chunks,
+                    "total_chunks": all_prompts.len(),
+                    "success": false,
+                    "error": err_msg,
+                    "timed_out": is_timeout,
+                    "elapsed_secs": elapsed.as_secs_f64(),
+                });
+                let log_file = dir.join(format!("goose-fix-{:03}.json", file_index + 1));
+                let _ = std::fs::write(
+                    &log_file,
+                    serde_json::to_string_pretty(&log_entry).unwrap_or_default(),
+                );
+            }
+
             (GooseFixResult {
                 file_path: file_path.to_path_buf(),
                 rule_id: file_requests
@@ -964,10 +1032,42 @@ fn process_single_file(
                     .collect::<Vec<_>>()
                     .join(", "),
                 success: false,
-                output: format!("Error: {}", e),
+                output: format!("Error: {}", err_msg),
+                timed_out: is_timeout,
             }, log)
         }
     }
+}
+
+// ── Companion test file section ────────────────────────────────────────────
+
+/// Format the companion test files section for inclusion in Goose prompts.
+///
+/// When companion test files are discovered, this produces a section listing
+/// them so the LLM knows it MUST read and check them alongside the main file.
+/// Returns an empty string when no test files are present.
+fn format_companion_test_files_section(test_files: &[PathBuf]) -> String {
+    if test_files.is_empty() {
+        return String::new();
+    }
+
+    let file_list: Vec<String> = test_files
+        .iter()
+        .map(|p| format!("- {}", p.display()))
+        .collect();
+
+    format!(
+        "\nCompanion test files — you MUST read these after applying fixes:\n{}\n\
+         After fixing the main file, read each test file above and check if any test:\n\
+         - Opens a dropdown/menu/popover and queries for content (getByText, getByRole)\n\
+         - Uses querySelector with OUIA selectors to interact with components\n\
+         - Asserts on element roles, aria attributes, or data attributes that changed\n\
+         If any test would break due to your changes, fix it. Common test fixes:\n\
+         - Wrap assertions in waitFor() when content renders via portal\n\
+         - Add popperProps={{{{ appendTo: 'inline' }}}} to component renders in tests\n\
+         - Update getByRole/getByText queries to match new attribute values\n",
+        file_list.join("\n"),
+    )
 }
 
 // ── Prompt construction ───────────────────────────────────────────────────
@@ -1001,12 +1101,14 @@ fn build_merged_prompt(request: &MergedLlmFixRequest, ctx: &dyn FixContext) -> S
         format!("\nIMPORTANT constraints:\n{}", lines.join("\n"))
     };
 
+    let test_files_section = format_companion_test_files_section(&request.companion_test_files);
+
     format!(
         r#"You are applying a {migration_desc} fix.
 
 File: {file_path}
 Line: {lines}
-
+{test_files_section}
 Migration rule [{rule_id}]:
 {message}
 
@@ -1021,6 +1123,7 @@ Instructions:
 3. Make the minimum edit necessary — do not change unrelated code, but DO clean up any artifacts caused by your change (e.g., remove imports that are no longer referenced, delete dead declarations)
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
 5. Write the fixed file
+6. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures (e.g., portal rendering means getByText/getByRole won't find dropdown content, renamed attributes break selectors). If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 
 Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it.
@@ -1029,6 +1132,7 @@ After writing the file, produce a '## Changes Applied' section that lists the ch
         migration_desc = ctx.migration_description(),
         file_path = request.file_path.display(),
         lines = lines_display,
+        test_files_section = test_files_section,
         rule_id = request.rule_id,
         message = request.message,
         code_context = code_context,
@@ -1102,6 +1206,15 @@ fn build_batch_prompt_with_context(
     previously_applied: Option<&[String]>,
     ctx: &dyn FixContext,
 ) -> String {
+    // Aggregate companion test files from all requests for this file
+    let mut all_test_files: Vec<PathBuf> = requests
+        .iter()
+        .flat_map(|r| r.companion_test_files.iter().cloned())
+        .collect();
+    all_test_files.sort();
+    all_test_files.dedup();
+    let test_files_section = format_companion_test_files_section(&all_test_files);
+
     // Group requests by component family so the LLM sees related rules
     // as one coherent migration (e.g., all Modal prop→child + composition
     // rules together) rather than independent fixes.
@@ -1184,7 +1297,7 @@ fn build_batch_prompt_with_context(
         r#"You are applying {migration_desc} fixes to a single file.
 
 File: {file_path}
-{context_section}
+{test_files_section}{context_section}
 Apply ALL of the following {count} fixes to this file:
 {fixes}
 Instructions:
@@ -1197,6 +1310,7 @@ Instructions:
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
 5. Do NOT revert any changes that were already applied in previous passes
 6. Write the fixed file once with ALL changes from every fix applied
+7. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures (e.g., portal rendering means getByText/getByRole won't find dropdown content, renamed attributes break selectors). If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 {verification_section}
 Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it.
@@ -1204,6 +1318,7 @@ Before writing, reason through each fix step by step to ensure nothing is missed
 After writing the file, produce a '## Changes Applied' section that lists each change you made, each fix that was already applied (no change needed), and each fix you could not apply (with a brief reason). This summary is used by subsequent processing steps."#,
         migration_desc = ctx.migration_description(),
         file_path = file_path.display(),
+        test_files_section = test_files_section,
         context_section = context_section,
         count = requests.len(),
         fixes = fixes,
@@ -1232,6 +1347,7 @@ mod tests {
             code_snip: code_snip.map(|s| s.to_string()),
             source: None,
             labels: Vec::new(),
+            companion_test_files: Vec::new(),
         }
     }
 

@@ -13,7 +13,7 @@ use anyhow::Result;
 use fix_engine_core::*;
 use konveyor_core::incident::Incident;
 use konveyor_core::report::RuleSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::language::LanguageFixProvider;
@@ -205,6 +205,7 @@ pub fn plan_fixes(
                             code_snip: incident.code_snip.clone(),
                             source: None, // filled lazily if LLM is invoked
                             labels: violation.labels.clone(),
+                            companion_test_files: lang.discover_companion_test_files(&file_path),
                         });
                     }
                 }
@@ -739,6 +740,14 @@ pub fn consolidate_family_requests(
             }
         }
 
+        // Aggregate companion test files from all family member requests
+        let mut family_test_files: Vec<PathBuf> = Vec::new();
+        for &idx in indices {
+            family_test_files.extend(requests[idx].companion_test_files.clone());
+        }
+        family_test_files.sort();
+        family_test_files.dedup();
+
         consolidated.push(LlmFixRequest {
             rule_id: format!("family:{}", family),
             file_uri: first_uri,
@@ -748,6 +757,7 @@ pub fn consolidate_family_requests(
             code_snip: None,
             source: None,
             labels: all_labels,
+            companion_test_files: family_test_files,
         });
 
         for &idx in indices {
@@ -764,6 +774,108 @@ pub fn consolidate_family_requests(
     }
     new_requests.extend(consolidated);
     *requests = new_requests;
+}
+
+/// Generate dedicated test-fix LLM requests for companion test files.
+///
+/// When a component file has both:
+/// 1. Test-impact violations (labels contain `change-type=test-impact`)
+/// 2. Companion test files discovered by the language provider
+///
+/// ...this function creates a separate `LlmFixRequest` targeting each test
+/// file directly. The test-fix request carries the full context of what
+/// changed in the component (from the test-impact violation message) so the
+/// LLM can apply the correct fix to the test.
+///
+/// These requests get their own Goose sessions, ensuring test files receive
+/// focused attention rather than being buried as a footnote in a component
+/// fix session with 7+ other changes.
+pub fn generate_test_fix_requests(requests: &[LlmFixRequest]) -> Vec<LlmFixRequest> {
+    let mut test_requests: Vec<LlmFixRequest> = Vec::new();
+    let mut seen_test_files: HashSet<PathBuf> = HashSet::new();
+
+    for req in requests {
+        // Only generate test-fix requests from test-impact violations
+        let has_test_impact = req
+            .labels
+            .iter()
+            .any(|l| l == "change-type=test-impact");
+        if !has_test_impact {
+            continue;
+        }
+
+        // Must have companion test files
+        if req.companion_test_files.is_empty() {
+            continue;
+        }
+
+        for test_file in &req.companion_test_files {
+            // Deduplicate: only create one request per test file even if
+            // multiple violations reference the same companion test
+            if !seen_test_files.insert(test_file.clone()) {
+                continue;
+            }
+
+            let test_file_name = test_file
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("test file");
+
+            let component_file_name = req
+                .file_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("component");
+
+            let message = format!(
+                "The component file {component_file} was modified with migration changes that \
+                 may break this test file.\n\n\
+                 Component changes that affect tests:\n\
+                 {original_message}\n\n\
+                 Instructions:\n\
+                 1. Read this test file at {test_path}\n\
+                 2. Read the component file at {component_path} to see the current (already migrated) code\n\
+                 3. For each test that interacts with the migrated component:\n\
+                    - If the test opens a dropdown/menu/popover and queries for content using \
+                      getByText/getByRole/findByText: the content now renders via portal to \
+                      document.body. Wrap assertions in waitFor() or add \
+                      popperProps={{{{ appendTo: 'inline' }}}} to the component render in the test.\n\
+                    - If the test uses querySelector with data attributes that changed \
+                      (e.g., OUIA selectors with PF5 prefix): update to the new attribute values.\n\
+                    - If the test uses getByRole with roles that changed: update the role queries.\n\
+                 4. Write the fixed test file",
+                component_file = component_file_name,
+                original_message = req.message,
+                test_path = test_file.display(),
+                component_path = req.file_path.display(),
+            );
+
+            test_requests.push(LlmFixRequest {
+                rule_id: format!("test-fix:{}", req.rule_id),
+                file_uri: format!("file://{}", test_file.display()),
+                file_path: test_file.clone(),
+                line: 1,
+                message,
+                code_snip: None,
+                source: None,
+                labels: vec![
+                    "source=semver-analyzer".into(),
+                    "change-type=test-fix".into(),
+                    "impact=frontend-testing".into(),
+                ],
+                companion_test_files: Vec::new(), // no further nesting
+            });
+
+            tracing::info!(
+                test_file = %test_file.display(),
+                component_file = %req.file_path.display(),
+                rule_id = %req.rule_id,
+                "Generated dedicated test-fix request for {}", test_file_name,
+            );
+        }
+    }
+
+    test_requests
 }
 
 /// Apply a fix plan to disk.
@@ -1348,6 +1460,7 @@ mod tests {
             code_snip: Some(format!("// line {}", line)),
             source: None,
             labels: labels.into_iter().map(|s| s.to_string()).collect(),
+            companion_test_files: Vec::new(),
         }
     }
 

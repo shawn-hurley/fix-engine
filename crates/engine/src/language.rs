@@ -93,13 +93,29 @@ pub trait LanguageFixProvider: Send + Sync {
     /// occurrences of the rename mappings.
     fn is_whole_file_rename(&self, incident: &Incident) -> bool;
 
+    /// Discover companion test files for a component source file.
+    ///
+    /// When the fix engine fixes a component file, its tests may also need
+    /// updating (e.g., portal behavior changes break jsdom assertions). This
+    /// method finds test files associated with a given source file using
+    /// language-specific conventions (e.g., `__tests__/*.test.tsx` for JS/TS).
+    ///
+    /// Returns paths of discovered test files. The fix engine includes these
+    /// in the LLM prompt so the LLM can read and edit them alongside the
+    /// component file.
+    ///
+    /// Default: returns empty vec (no test file discovery).
+    fn discover_companion_test_files(&self, _file_path: &Path) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
     /// Capture baseline state before edits are written to disk.
     ///
     /// Called once before any files are modified. Implementations can capture
     /// pre-existing state needed for diffing in `post_apply` — e.g., the set
     /// of unmet peer dependencies before package version updates, so that
     /// `post_apply` only installs *newly* introduced peers rather than
-    /// pre-existing intentionally-unmet ones (like host-provided shared modules).
+    /// pre-existing intentionally-unmet ones (e.g., host-provided shared modules).
     ///
     /// Returns opaque state that will be forwarded to `post_apply`.
     ///

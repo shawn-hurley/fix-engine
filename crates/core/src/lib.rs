@@ -103,6 +103,10 @@ pub struct LlmFixRequest {
     /// Used to coalesce related rules into coherent migration groups.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// Companion test files discovered near the component file.
+    /// The LLM can read and edit these to fix tests broken by component changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub companion_test_files: Vec<PathBuf>,
 }
 
 /// Result of applying a fix plan.
