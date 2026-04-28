@@ -1,0 +1,29 @@
+[package]
+name = "fix-engine-java-fix"
+version = "0.0.2"
+edition = "2021"
+description = "Java language-specific fix operations for the fix engine"
+license = "Apache-2.0"
+
+[dependencies]
+fix-engine-core = { version = "0.0.2", path = "../core" }
+fix-engine = { version = "0.0.2", path = "../engine" }
+konveyor-core = { workspace = true }
+
+# Serialization (for incident variable inspection)
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+
+# Utilities
+regex = "1"
+
+# XML parsing (for pom.xml dependency updates)
+quick-xml = "0.37"
+
+[dev-dependencies]
+tempfile = "3"
