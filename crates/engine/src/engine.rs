@@ -36,6 +36,12 @@ pub fn plan_fixes(
 ) -> Result<FixPlan> {
     let mut plan = FixPlan::default();
 
+    // Pre-compute dead CSS class texts from violations labeled
+    // "change-type=css-dead-class". These are classes where a naive
+    // v5→v6 prefix swap produces a non-existent class. Used to suppress
+    // CssVariablePrefix edits that would create broken class references.
+    let dead_css_classes = collect_dead_css_classes(output);
+
     for ruleset in output {
         for (rule_id, violation) in &ruleset.violations {
             // Lookup order: strategies map -> label inference -> LLM fallback
@@ -126,6 +132,42 @@ pub fn plan_fixes(
                                 code_snip: incident.code_snip.clone(),
                             });
                             continue;
+                        }
+
+                        // Check if applying this prefix swap would produce a
+                        // dead CSS class (one that doesn't exist in the target
+                        // version). This catches cases where a broad prefix rule
+                        // (e.g., pf-v5-c-expandable-section → pf-v6-c-expandable-section)
+                        // would incorrectly transform a substring of a dead class
+                        // (e.g., pf-v5-c-expandable-section__toggle → non-existent
+                        // pf-v6-c-expandable-section__toggle).
+                        if !dead_css_classes.is_empty() && !matched_text.is_empty() {
+                            let would_produce =
+                                matched_text.replace(old_prefix.as_str(), new_prefix.as_str());
+                            if dead_css_classes.iter().any(|dead| {
+                                would_produce.contains(dead.as_str())
+                                    || dead.contains(would_produce.as_str())
+                            }) {
+                                tracing::debug!(
+                                    rule_id = %rule_id,
+                                    matched = %matched_text,
+                                    would_produce = %would_produce,
+                                    "Suppressing CssVariablePrefix — swap would produce dead class"
+                                );
+                                plan.manual.push(ManualFixItem {
+                                    rule_id: rule_id.clone(),
+                                    file_uri: incident.file_uri.clone(),
+                                    line: incident.line_number.unwrap_or(0),
+                                    message: format!(
+                                        "CSS class '{}' swap suppressed — '{}' does not exist in the target version. {}",
+                                        matched_text,
+                                        would_produce,
+                                        incident.message,
+                                    ),
+                                    code_snip: incident.code_snip.clone(),
+                                });
+                                continue;
+                            }
                         }
 
                         // Treat CSS prefix changes as renames
@@ -916,6 +958,43 @@ pub fn generate_test_fix_requests(requests: &[LlmFixRequest]) -> Vec<LlmFixReque
     }
 
     test_requests
+}
+
+/// Collect CSS class texts from violations labeled `change-type=css-dead-class`.
+///
+/// These are CSS classes where a naive version prefix swap (e.g.,
+/// `pf-v5-c-expandable-section__toggle` → `pf-v6-c-expandable-section__toggle`)
+/// produces a class that does NOT exist in the target CSS distribution.
+/// Used to suppress `CssVariablePrefix` edits that would create broken references.
+fn collect_dead_css_classes(output: &[RuleSet]) -> std::collections::HashSet<String> {
+    let mut dead = std::collections::HashSet::new();
+    for rs in output {
+        for violation in rs.violations.values() {
+            let is_dead = violation
+                .labels
+                .iter()
+                .any(|l| l == "change-type=css-dead-class");
+            if !is_dead {
+                continue;
+            }
+            for inc in &violation.incidents {
+                // Collect the matched text or class name from the incident.
+                // The dead-class rules may use either variable depending on
+                // whether the scanner matched a className or a matchingText.
+                if let Some(mt) = inc
+                    .variables
+                    .get("matchingText")
+                    .and_then(|v| v.as_str())
+                {
+                    dead.insert(mt.to_string());
+                }
+                if let Some(cn) = inc.variables.get("className").and_then(|v| v.as_str()) {
+                    dead.insert(cn.to_string());
+                }
+            }
+        }
+    }
+    dead
 }
 
 /// Apply a fix plan to disk.
