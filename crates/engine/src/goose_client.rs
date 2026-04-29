@@ -1280,7 +1280,7 @@ Instructions:
 2. Apply ONLY the change described by the migration rule at or near line {lines}
 3. Make the minimum edit necessary — do not change unrelated code, but DO clean up any artifacts caused by your change (e.g., remove imports that are no longer referenced, delete dead declarations)
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
-5. Write the fixed file
+5. Write the fixed file. IMPORTANT: Preserve all Unicode characters exactly as they appear in the original file — do NOT normalize curly quotes (\u2018 \u2019 \u201C \u201D), em dashes (\u2014), or other non-ASCII characters to ASCII equivalents. Replacing e.g. \u2019 with ' inside a single-quoted string creates a syntax error.
 6. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 
@@ -1467,7 +1467,7 @@ Instructions:
 3. Make the minimum edits necessary — do not change unrelated code, but DO clean up any artifacts caused by your changes (e.g., remove imports that are no longer referenced, delete dead declarations)
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
 5. Do NOT revert any changes that were already applied in previous passes
-6. Write the fixed file once with ALL changes from every fix applied
+6. Write the fixed file once with ALL changes from every fix applied. IMPORTANT: Preserve all Unicode characters exactly as they appear in the original file — do NOT normalize curly quotes (\u2018 \u2019 \u201C \u201D), em dashes (\u2014), or other non-ASCII characters to ASCII equivalents. Replacing e.g. \u2019 with ' inside a single-quoted string creates a syntax error.
 7. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 {verification_section}

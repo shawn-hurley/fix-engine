@@ -322,6 +322,14 @@ pub enum FixStrategy {
         package: String,
         new_version: String,
     },
+    /// Java-specific import + class rename. Replaces the import statement
+    /// and does word-boundary-aware replacement of the class name throughout
+    /// the file. Safer than generic `Rename` for Java code because it won't
+    /// match substrings of unrelated identifiers.
+    JavaImportRename {
+        old_fqn: String,
+        new_fqn: String,
+    },
     /// No auto-fix available -- flag for manual review.
     Manual,
     /// Send to LLM for fix generation.
@@ -416,6 +424,18 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
         "FamilyMigration" => FixStrategy::Llm {
             context: Some(format_family_migration_context(entry)),
         },
+        // Java import + class rename: replaces import statement and
+        // does word-boundary-aware class name replacement throughout the file.
+        "JavaImportRename" => {
+            if let (Some(from), Some(to)) = (&entry.from, &entry.to) {
+                FixStrategy::JavaImportRename {
+                    old_fqn: from.clone(),
+                    new_fqn: to.clone(),
+                }
+            } else {
+                FixStrategy::Manual
+            }
+        }
         // Java-specific strategies from semver-analyzer
         "UpdateType" => {
             // Simple single-word type swaps (e.g., Serializable → Object) can

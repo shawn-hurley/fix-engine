@@ -95,6 +95,18 @@ impl LanguageFixProvider for JavaFixProvider {
             || incident.variables.contains_key("module")
     }
 
+    fn plan_import_rename(
+        &self,
+        rule_id: &str,
+        incident: &Incident,
+        old_fqn: &str,
+        new_fqn: &str,
+        file_path: &Path,
+        report: &mut FixReport,
+    ) -> Option<PlannedFix> {
+        plan_java_import_rename(rule_id, incident, old_fqn, new_fqn, file_path, report)
+    }
+
     fn discover_companion_test_files(&self, file_path: &Path) -> Vec<PathBuf> {
         discover_java_companion_test_files(file_path)
     }
@@ -118,6 +130,174 @@ fn dedup_java_imports(lines: &mut [String]) {
             }
         }
     }
+}
+
+// ── Import rename ──────────────────────────────────────────────────────────
+
+/// Plan a Java import + class rename.
+///
+/// Given old and new fully-qualified names (e.g., `org.hibernate.type.StringType`
+/// → `org.hibernate.type.JavaObjectType`), this function:
+///
+/// 1. Replaces the import statement: `import old.Foo;` → `import new.Bar;`
+/// 2. If the simple class name changed, does word-boundary-aware replacement
+///    of the old class name with the new one throughout the file.
+///
+/// Word-boundary awareness prevents mangling unrelated identifiers — e.g.,
+/// renaming `read` to `extract` won't turn `Thread` into `Thextract`.
+fn plan_java_import_rename(
+    rule_id: &str,
+    incident: &Incident,
+    old_fqn: &str,
+    new_fqn: &str,
+    file_path: &Path,
+    report: &mut FixReport,
+) -> Option<PlannedFix> {
+    let source = std::fs::read_to_string(file_path).ok()?;
+    let source_lines: Vec<&str> = source.lines().collect();
+
+    if source_lines.is_empty() {
+        return None;
+    }
+
+    // Extract simple class names from FQNs
+    let old_class = old_fqn.rsplit('.').next().unwrap_or(old_fqn);
+    let new_class = new_fqn.rsplit('.').next().unwrap_or(new_fqn);
+    let class_changed = old_class != new_class;
+
+    let mut edits = Vec::new();
+
+    // Phase 1: Find and replace import statements containing old_fqn.
+    // Handles both exact FQN imports (`import org.old.Foo;`) and
+    // namespace prefix imports (`import javax.persistence.Entity;` when
+    // old_fqn is `javax.persistence`).
+    for (idx, line) in source_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if (trimmed.starts_with("import ") || trimmed.starts_with("import static "))
+            && trimmed.contains(old_fqn)
+        {
+            let new_line = line.replace(old_fqn, new_fqn);
+            if new_line != *line {
+                edits.push(TextEdit {
+                    line: (idx + 1) as u32,
+                    old_text: line.to_string(),
+                    new_text: new_line,
+                    rule_id: rule_id.to_string(),
+                    description: format!("Replace import: {} → {}", old_fqn, new_fqn),
+                    replace_all: false,
+                });
+            }
+        }
+    }
+
+    // Phase 2: If the class name changed, do word-boundary-aware replacement
+    // in the rest of the file (skip import lines — already handled above)
+    if class_changed {
+        for (idx, line) in source_lines.iter().enumerate() {
+            let trimmed = line.trim();
+            // Skip import lines (already handled) and blank lines
+            if trimmed.starts_with("import ") || trimmed.is_empty() {
+                continue;
+            }
+
+            if let Some(new_line) = replace_at_word_boundary(line, old_class, new_class) {
+                edits.push(TextEdit {
+                    line: (idx + 1) as u32,
+                    old_text: line.to_string(),
+                    new_text: new_line,
+                    rule_id: rule_id.to_string(),
+                    description: format!("Rename class: {} → {}", old_class, new_class),
+                    replace_all: false,
+                });
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        report.record_skip(
+            rule_id,
+            &incident.file_uri,
+            incident.line_number,
+            SkipReason::TextNotFound,
+            Some(format!("import {} not found in file", old_fqn)),
+        );
+        return None;
+    }
+
+    let description = if class_changed {
+        format!("Rename import {} → {} and class {} → {}", old_fqn, new_fqn, old_class, new_class)
+    } else {
+        format!("Rename import {} → {}", old_fqn, new_fqn)
+    };
+
+    Some(PlannedFix {
+        rule_id: rule_id.to_string(),
+        file_uri: incident.file_uri.clone(),
+        line: incident.line_number.unwrap_or(1),
+        description,
+        edits,
+        source: FixSource::Pattern,
+        confidence: FixConfidence::High,
+    })
+}
+
+/// Replace all occurrences of `old` with `new` in `line`, but only at word
+/// boundaries. Returns `None` if no replacement was made.
+///
+/// A word boundary means the character immediately before and after the match
+/// must NOT be alphanumeric or underscore (`[a-zA-Z0-9_]`).
+fn replace_at_word_boundary(line: &str, old: &str, new: &str) -> Option<String> {
+    if old.is_empty() || !line.contains(old) {
+        return None;
+    }
+
+    let mut result = String::with_capacity(line.len());
+    let mut pos = 0;
+    let line_bytes = line.as_bytes();
+    let mut changed = false;
+
+    while pos < line.len() {
+        if let Some(match_start) = line[pos..].find(old) {
+            let abs_start = pos + match_start;
+            let abs_end = abs_start + old.len();
+
+            // Check word boundary before the match
+            let boundary_before = if abs_start == 0 {
+                true
+            } else {
+                let c = line_bytes[abs_start - 1] as char;
+                !c.is_alphanumeric() && c != '_'
+            };
+
+            // Check word boundary after the match
+            let boundary_after = if abs_end >= line.len() {
+                true
+            } else {
+                let c = line_bytes[abs_end] as char;
+                !c.is_alphanumeric() && c != '_'
+            };
+
+            // Copy everything before the match
+            result.push_str(&line[pos..abs_start]);
+
+            if boundary_before && boundary_after {
+                // Word boundary match — do the replacement
+                result.push_str(new);
+                changed = true;
+            } else {
+                // Not a word boundary — keep original text
+                result.push_str(old);
+            }
+
+            pos = abs_end;
+        } else {
+            // No more matches — copy the rest
+            result.push_str(&line[pos..]);
+            break;
+        }
+    }
+
+    if changed { Some(result) } else { None }
 }
 
 // ── Annotation removal ─────────────────────────────────────────────────────
@@ -506,5 +686,103 @@ mod tests {
             get_matched_text_for_rename_from_incident(&incident, &mappings),
             "Criteria"
         );
+    }
+
+    // ── replace_at_word_boundary tests ──────────────────────────────────
+
+    #[test]
+    fn test_word_boundary_simple_match() {
+        let result = replace_at_word_boundary("StringType x = new StringType();", "StringType", "JavaObjectType");
+        assert_eq!(result, Some("JavaObjectType x = new JavaObjectType();".to_string()));
+    }
+
+    #[test]
+    fn test_word_boundary_no_substring_match() {
+        // "read" should NOT match inside "Thread"
+        let result = replace_at_word_boundary("List<Thread> threads = new ArrayList<>();", "read", "extract");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_word_boundary_no_match_in_already() {
+        // "read" should NOT match inside "Already"
+        let result = replace_at_word_boundary("throw new AlreadyInitializedException();", "read", "extract");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_word_boundary_no_match_in_readonly() {
+        // "read" should NOT match inside "readOnly" because 'O' is alphanumeric after
+        let result = replace_at_word_boundary("initValues.readOnly = false;", "read", "extract");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_word_boundary_standalone_match() {
+        // "read" should match when it stands alone
+        let result = replace_at_word_boundary("Object result = scrollable.read(0);", "read", "extract");
+        assert_eq!(result, Some("Object result = scrollable.extract(0);".to_string()));
+    }
+
+    #[test]
+    fn test_word_boundary_at_line_start() {
+        let result = replace_at_word_boundary("StringType foo;", "StringType", "JavaObjectType");
+        assert_eq!(result, Some("JavaObjectType foo;".to_string()));
+    }
+
+    #[test]
+    fn test_word_boundary_at_line_end() {
+        let result = replace_at_word_boundary("return new StringType", "StringType", "JavaObjectType");
+        assert_eq!(result, Some("return new JavaObjectType".to_string()));
+    }
+
+    #[test]
+    fn test_word_boundary_connection_not_in_jdbc_connection_access() {
+        // "connection" should NOT match inside "JdbcConnectionAccess"
+        let result = replace_at_word_boundary(
+            "import org.hibernate.engine.jdbc.connections.spi.JdbcConnectionAccess;",
+            "connection",
+            "getSession",
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_word_boundary_connection_standalone() {
+        let result = replace_at_word_boundary("Connection conn = session.connection();", "connection", "getSession");
+        assert_eq!(result, Some("Connection conn = session.getSession();".to_string()));
+    }
+
+    #[test]
+    fn test_word_boundary_no_match_returns_none() {
+        let result = replace_at_word_boundary("int x = 42;", "StringType", "JavaObjectType");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_word_boundary_multiple_matches() {
+        let result = replace_at_word_boundary(
+            "StringType a = StringType.valueOf(StringType.class);",
+            "StringType",
+            "JavaObjectType",
+        );
+        assert_eq!(
+            result,
+            Some("JavaObjectType a = JavaObjectType.valueOf(JavaObjectType.class);".to_string())
+        );
+    }
+
+    #[test]
+    fn test_word_boundary_dot_is_boundary() {
+        // A dot should be a word boundary
+        let result = replace_at_word_boundary("session.read(0)", "read", "extract");
+        assert_eq!(result, Some("session.extract(0)".to_string()));
+    }
+
+    #[test]
+    fn test_word_boundary_underscore_is_not_boundary() {
+        // Underscore is NOT a word boundary (part of identifier)
+        let result = replace_at_word_boundary("my_read_method()", "read", "extract");
+        assert_eq!(result, None);
     }
 }

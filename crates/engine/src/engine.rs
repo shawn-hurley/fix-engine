@@ -90,6 +90,16 @@ pub fn plan_fixes(
                             plan.files.entry(file_path).or_default().push(fix);
                         }
                     }
+                    FixStrategy::JavaImportRename {
+                        ref old_fqn,
+                        ref new_fqn,
+                    } => {
+                        if let Some(fix) = lang.plan_import_rename(
+                            rule_id, incident, old_fqn, new_fqn, &file_path, report,
+                        ) {
+                            plan.files.entry(file_path).or_default().push(fix);
+                        }
+                    }
                     FixStrategy::CssVariablePrefix {
                         old_prefix,
                         new_prefix,
