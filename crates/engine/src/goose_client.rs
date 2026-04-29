@@ -183,6 +183,9 @@ struct MergedLlmFixRequest {
     /// Component family (e.g., "Modal", "Select") extracted from labels.
     /// Used to group related rules in the batch prompt.
     family: Option<String>,
+    /// Labels from the violation (e.g., "change-type=prop-to-child").
+    /// Used to generate targeted test file instructions.
+    labels: Vec<String>,
     /// Companion test files discovered near the component file.
     companion_test_files: Vec<PathBuf>,
 }
@@ -223,6 +226,7 @@ fn merge_by_rule_id(requests: &[&LlmFixRequest]) -> Vec<MergedLlmFixRequest> {
                 message: req.message.clone(),
                 code_snips,
                 family,
+                labels: req.labels.clone(),
                 companion_test_files: req.companion_test_files.clone(),
             });
         }
@@ -1087,7 +1091,10 @@ fn process_single_file(
 /// When companion test files are discovered, this produces a section listing
 /// them so the LLM knows it MUST read and check them alongside the main file.
 /// Returns an empty string when no test files are present.
-fn format_companion_test_files_section(test_files: &[PathBuf]) -> String {
+fn format_companion_test_files_section(
+    test_files: &[PathBuf],
+    requests: &[&MergedLlmFixRequest],
+) -> String {
     if test_files.is_empty() {
         return String::new();
     }
@@ -1097,11 +1104,124 @@ fn format_companion_test_files_section(test_files: &[PathBuf]) -> String {
         .map(|p| format!("- {}", p.display()))
         .collect();
 
+    // Build targeted test-fix instructions from the rules being applied.
+    let mut test_hints = Vec::new();
+
+    // Extract concrete search terms from rule messages: component names,
+    // old API names, CSS classes, etc.
+    let mut search_terms = Vec::new();
+    let mut has_dom_changes = false;
+    let mut has_rename = false;
+    let mut has_import_change = false;
+
+    for req in requests {
+        // Check labels for change types
+        for label in &req.labels {
+            if label.starts_with("change-type=") {
+                let ct = &label["change-type=".len()..];
+                match ct {
+                    "prop-to-child" | "composition" | "dom-structure" => {
+                        has_dom_changes = true;
+                    }
+                    "rename" => {
+                        has_rename = true;
+                    }
+                    "import-path-change" => {
+                        has_import_change = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Extract old → new names from the rule message for search terms.
+        // Look for patterns like "renamed to X", "changed from X to Y",
+        // "removed", "moved to"
+        if req.family.is_some() {
+            has_dom_changes = true;
+        }
+
+        // Check for test-impact related content in the message
+        if req.message.contains("wrapper")
+            || req.message.contains("children")
+            || req.message.contains("getByText")
+        {
+            has_dom_changes = true;
+        }
+    }
+
+    // Collect component/rule names as search hints
+    for req in requests {
+        // Extract component names from rule IDs for search terms
+        // e.g., "semver-text-component-import-deprecated" → "Text"
+        // e.g., "family:Modal" → "Modal"
+        if let Some(ref fam) = req.family {
+            search_terms.push(fam.clone());
+        }
+        if req.rule_id.contains("rename") || req.rule_id.contains("deprecated") {
+            has_rename = true;
+        }
+    }
+    search_terms.sort();
+    search_terms.dedup();
+
+    // Always include the concrete search instruction
+    test_hints.push(
+        "Search the test file for every old API name, component name, or CSS class \
+         that you changed in the main file. If you renamed X to Y, search the test \
+         for 'X' in strings, role queries, text queries, and selectors."
+            .to_string(),
+    );
+
+    if has_dom_changes {
+        test_hints.push(
+            "Component DOM structure changed. Tests using getByText() may now return \
+             a wrapper element (e.g., <span>) instead of the component root (e.g., \
+             <button>). Check assertions like toBeInstanceOf(), toHaveFocus(), and \
+             closest(). Consider using getByRole() with a name option instead."
+                .to_string(),
+        );
+    }
+
+    if has_rename {
+        test_hints.push(
+            "Components or props were renamed. Search the test for old names in \
+             getByRole(), getByLabelText(), getByText(), querySelector(), and \
+             data-testid selectors. Update them to the new names."
+                .to_string(),
+        );
+    }
+
+    if has_import_change {
+        test_hints.push(
+            "Import paths changed. If the test file mocks the old import source, \
+             update the mock to use the new import path. If the test imports \
+             components directly, update those imports too."
+                .to_string(),
+        );
+    }
+
+    if !search_terms.is_empty() {
+        test_hints.push(format!(
+            "Specifically search for these names in the test file: {}",
+            search_terms.join(", "),
+        ));
+    }
+
+    let hints_section = test_hints
+        .iter()
+        .map(|h| format!("- {}", h))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     format!(
-        "\nCompanion test files — you MUST read these after applying fixes:\n{}\n\
-         After fixing the main file, read each test file above and check if any \
-         test would break due to your changes. If a test would break, fix it.\n",
-        file_list.join("\n"),
+        "\nCompanion test files — you MUST read these after applying fixes:\n{file_list}\n\
+         After fixing the main file, read each test file and verify it still works \
+         with your changes. Fix any test that would break.\n\n\
+         Verification steps:\n\
+         {hints}\n",
+        file_list = file_list.join("\n"),
+        hints = hints_section,
     )
 }
 
@@ -1136,7 +1256,10 @@ fn build_merged_prompt(request: &MergedLlmFixRequest, ctx: &dyn FixContext) -> S
         format!("\nIMPORTANT constraints:\n{}", lines.join("\n"))
     };
 
-    let test_files_section = format_companion_test_files_section(&request.companion_test_files);
+    let test_files_section = format_companion_test_files_section(
+        &request.companion_test_files,
+        &[request],
+    );
 
     format!(
         r#"You are applying a {migration_desc} fix.
@@ -1248,7 +1371,7 @@ fn build_batch_prompt_with_context(
         .collect();
     all_test_files.sort();
     all_test_files.dedup();
-    let test_files_section = format_companion_test_files_section(&all_test_files);
+    let test_files_section = format_companion_test_files_section(&all_test_files, requests);
 
     // Group requests by component family so the LLM sees related rules
     // as one coherent migration (e.g., all Modal prop→child + composition
