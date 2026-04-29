@@ -109,6 +109,26 @@ pub trait LanguageFixProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Plan a language-specific import rename.
+    ///
+    /// Given an incident flagging an import for class/type rename, produce a
+    /// [`PlannedFix`] that replaces the import statement and does
+    /// word-boundary-aware class name replacement throughout the file.
+    ///
+    /// Default: returns `None` (not supported).
+    #[allow(unused_variables)]
+    fn plan_import_rename(
+        &self,
+        rule_id: &str,
+        incident: &Incident,
+        old_fqn: &str,
+        new_fqn: &str,
+        file_path: &Path,
+        report: &mut FixReport,
+    ) -> Option<PlannedFix> {
+        None
+    }
+
     /// Capture baseline state before edits are written to disk.
     ///
     /// Called once before any files are modified. Implementations can capture
