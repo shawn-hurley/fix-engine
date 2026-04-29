@@ -416,6 +416,29 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
         "FamilyMigration" => FixStrategy::Llm {
             context: Some(format_family_migration_context(entry)),
         },
+        // Java-specific strategies from semver-analyzer
+        "UpdateType" => {
+            // Simple single-word type swaps (e.g., Serializable → Object) can
+            // use mechanical rename. Complex types go to LLM.
+            if let (Some(from), Some(to)) = (&entry.from, &entry.to) {
+                if !from.contains(' ') && !to.contains(' ') && !from.contains('<') {
+                    FixStrategy::Rename(vec![RenameMapping {
+                        old: from.clone(),
+                        new: to.clone(),
+                    }])
+                } else {
+                    FixStrategy::Llm {
+                        context: Some(format_strategy_context(entry)),
+                    }
+                }
+            } else {
+                FixStrategy::Manual
+            }
+        }
+        "UpdateSignature" => FixStrategy::Llm {
+            context: Some(format_strategy_context(entry)),
+        },
+        "ManualReview" => FixStrategy::Manual,
         _ => FixStrategy::Manual,
     }
 }
