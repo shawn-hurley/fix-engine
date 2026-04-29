@@ -148,22 +148,68 @@ pub fn plan_fixes(
                         ref package,
                         ref new_version,
                     } => {
-                        // Delegate to the language provider for ecosystem-specific
-                        // dependency management (package.json, Cargo.toml, go.mod, etc.)
-                        // A single incident may produce multiple fixes (e.g., a lockfile
-                        // incident resolving multiple parent packages to update).
-                        let fixes = lang.plan_ensure_dependency(
-                            rule_id,
-                            incident,
-                            package,
-                            new_version,
-                            &file_path,
-                            report,
-                        );
-                        for fix in fixes {
-                            let dep_file = fix.file_uri.clone();
-                            let dep_path = uri_to_path(&dep_file, project_root);
-                            plan.files.entry(dep_path).or_default().push(fix);
+                        // Source file incidents (e.g., .tsx importing from the wrong
+                        // package) need an import rewrite, not just a manifest update.
+                        // Route them to the LLM path so goose can rewrite the import.
+                        // The manifest update still happens via plan_ensure_dependency
+                        // with the find_nearest_package_json fallback.
+                        let ext = file_path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        if matches!(ext, "tsx" | "ts" | "jsx" | "js") {
+                            let mut enriched_message = incident.message.clone();
+                            if let (Some(imported), Some(module)) = (
+                                incident
+                                    .variables
+                                    .get("importedName")
+                                    .and_then(|v| v.as_str()),
+                                incident
+                                    .variables
+                                    .get("module")
+                                    .and_then(|v| v.as_str()),
+                            ) {
+                                enriched_message = format!(
+                                    "Import '{}' is from '{}' but needs to move to \
+                                     '{}' (version {}).\n\n\
+                                     Change the import source from '{}' to '{}'.\n\n{}",
+                                    imported,
+                                    module,
+                                    package,
+                                    new_version,
+                                    module,
+                                    package,
+                                    enriched_message,
+                                );
+                            }
+                            plan.pending_llm.push(LlmFixRequest {
+                                rule_id: rule_id.clone(),
+                                file_uri: incident.file_uri.clone(),
+                                file_path: file_path.clone(),
+                                line: incident.line_number.unwrap_or(0),
+                                message: enriched_message,
+                                code_snip: incident.code_snip.clone(),
+                                source: None,
+                                labels: vec![],
+                                companion_test_files: lang
+                                    .discover_companion_test_files(&file_path),
+                            });
+                        } else {
+                            // Manifest/lockfile incidents — delegate to language
+                            // provider for ecosystem-specific dependency management.
+                            let fixes = lang.plan_ensure_dependency(
+                                rule_id,
+                                incident,
+                                package,
+                                new_version,
+                                &file_path,
+                                report,
+                            );
+                            for fix in fixes {
+                                let dep_file = fix.file_uri.clone();
+                                let dep_path = uri_to_path(&dep_file, project_root);
+                                plan.files.entry(dep_path).or_default().push(fix);
+                            }
                         }
                     }
                     FixStrategy::Manual => {
