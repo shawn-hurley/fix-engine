@@ -332,6 +332,7 @@ pub fn run_all_goose_fixes(
     printer: &crate::progress::ProgressPrinter,
     timeout_secs: u64,
     max_families_per_chunk: usize,
+    test_command: Option<&str>,
 ) -> Vec<GooseFixResult> {
     // Create log directory if specified, archiving logs from previous
     // runs into a timestamped subdirectory. Without cleanup, errored
@@ -483,6 +484,7 @@ pub fn run_all_goose_fixes(
                     log_dir,
                     timeout_secs,
                     max_families_per_chunk,
+                    test_command,
                 );
 
                 if i == 0 {
@@ -552,6 +554,7 @@ fn process_single_file(
     log_dir: Option<&std::path::Path>,
     timeout_secs: u64,
     max_families_per_chunk: usize,
+    test_command: Option<&str>,
 ) -> (GooseFixResult, Vec<String>) {
     let mut log: Vec<String> = Vec::new();
 
@@ -600,10 +603,17 @@ fn process_single_file(
     let mut chunk_retried: Vec<bool> = Vec::new();
     let mut applied_summaries: Vec<String> = Vec::new();
 
+    let has_test_files = file_requests
+        .iter()
+        .any(|r| !r.companion_test_files.is_empty());
+    let has_test_cmd = test_command.is_some() && has_test_files;
+
     if file_requests.len() == 1 {
-        let prompt = build_merged_prompt(&file_requests[0], ctx);
+        let prompt = build_merged_prompt(&file_requests[0], ctx, test_command);
         all_prompts.push(prompt.clone());
-        let max_turns_str = "5".to_string();
+        // Increase turns when running tests — the LLM needs headroom for
+        // fix → test → read error → fix → re-test iterations.
+        let max_turns_str = if has_test_cmd { "15" } else { "5" }.to_string();
         let mut goose_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
         let mut was_retried = false;
         // Retry once on empty response
@@ -718,10 +728,15 @@ fn process_single_file(
                     Some(&applied_summaries)
                 },
                 ctx,
+                test_command,
             );
             all_prompts.push(prompt.clone());
 
-            let max_turns = (22 + chunk.len()).min(40);
+            let max_turns = if has_test_cmd {
+                (30 + chunk.len()).min(50)
+            } else {
+                (22 + chunk.len()).min(40)
+            };
             let max_turns_str = max_turns.to_string();
             let chunk_start = std::time::Instant::now();
             let mut chunk_result = run_goose_with_timeout(&prompt, &max_turns_str, timeout_secs);
@@ -1094,6 +1109,7 @@ fn process_single_file(
 fn format_companion_test_files_section(
     test_files: &[PathBuf],
     requests: &[&MergedLlmFixRequest],
+    test_command: Option<&str>,
 ) -> String {
     if test_files.is_empty() {
         return String::new();
@@ -1214,14 +1230,42 @@ fn format_companion_test_files_section(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let test_run_section = if let Some(cmd_template) = test_command {
+        let commands: Vec<String> = test_files
+            .iter()
+            .map(|f| {
+                cmd_template.replace("{test_file}", &f.display().to_string())
+            })
+            .collect();
+
+        format!(
+            "\n## REQUIRED: Run tests to verify your changes\n\
+             After fixing the main file AND any companion test files, you MUST run \
+             the tests to verify everything works. Run this command:\n\n\
+             ```bash\n{}\n```\n\n\
+             If tests fail:\n\
+             1. Read the failure output carefully — it tells you the exact assertion \
+             that failed, what was expected vs what was received\n\
+             2. Fix the test file based on the ACTUAL error (not guessing)\n\
+             3. Re-run the test to confirm your fix\n\
+             4. Repeat until tests pass or you have made 3 attempts\n\n\
+             Do NOT skip this step. Do NOT guess whether tests will pass — run them.\n",
+            commands.join("\n"),
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "\nCompanion test files — you MUST read these after applying fixes:\n{file_list}\n\
          After fixing the main file, read each test file and verify it still works \
          with your changes. Fix any test that would break.\n\n\
          Verification steps:\n\
-         {hints}\n",
+         {hints}\n\
+         {test_run}\n",
         file_list = file_list.join("\n"),
         hints = hints_section,
+        test_run = test_run_section,
     )
 }
 
@@ -1229,7 +1273,11 @@ fn format_companion_test_files_section(
 
 /// Build a prompt for a single merged fix request (one unique rule, possibly
 /// multiple incident lines).
-fn build_merged_prompt(request: &MergedLlmFixRequest, ctx: &dyn FixContext) -> String {
+fn build_merged_prompt(
+    request: &MergedLlmFixRequest,
+    ctx: &dyn FixContext,
+    test_command: Option<&str>,
+) -> String {
     let lines_display = request
         .lines
         .iter()
@@ -1259,6 +1307,7 @@ fn build_merged_prompt(request: &MergedLlmFixRequest, ctx: &dyn FixContext) -> S
     let test_files_section = format_companion_test_files_section(
         &request.companion_test_files,
         &[request],
+        test_command,
     );
 
     format!(
@@ -1363,6 +1412,7 @@ fn build_batch_prompt_with_context(
     requests: &[&MergedLlmFixRequest],
     previously_applied: Option<&[String]>,
     ctx: &dyn FixContext,
+    test_command: Option<&str>,
 ) -> String {
     // Aggregate companion test files from all requests for this file
     let mut all_test_files: Vec<PathBuf> = requests
@@ -1371,7 +1421,8 @@ fn build_batch_prompt_with_context(
         .collect();
     all_test_files.sort();
     all_test_files.dedup();
-    let test_files_section = format_companion_test_files_section(&all_test_files, requests);
+    let test_files_section =
+        format_companion_test_files_section(&all_test_files, requests, test_command);
 
     // Group requests by component family so the LLM sees related rules
     // as one coherent migration (e.g., all Modal prop→child + composition
@@ -1649,6 +1700,7 @@ mod tests {
             &merged_refs,
             None,
             &ctx,
+            None,
         );
 
         // All rules appear in the prompt

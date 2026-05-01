@@ -133,6 +133,18 @@ pub struct FixOpts {
     /// files with a larger --goose-timeout.
     #[arg(long)]
     pub only_files: Option<PathBuf>,
+
+    /// Command to run tests for companion test files after the LLM applies
+    /// fixes. The placeholder `{test_file}` is replaced with the test file
+    /// path. When set, the LLM prompt instructs the model to run the test,
+    /// read any failures, and iterate on fixes.
+    ///
+    /// Can also be set via `FIX_ENGINE_TEST_COMMAND` environment variable.
+    /// The CLI flag takes precedence over the environment variable.
+    ///
+    /// Example: --test-command "npx jest --testPathPattern={test_file} --no-coverage --forceExit"
+    #[arg(long, env = "FIX_ENGINE_TEST_COMMAND")]
+    pub test_command: Option<String>,
 }
 
 pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) -> Result<()> {
@@ -412,6 +424,7 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
                         &printer,
                         opts.goose_timeout,
                         opts.goose_max_families,
+                        opts.test_command.as_deref(),
                     );
 
                     let succeeded = results.iter().filter(|r| r.success).count();
