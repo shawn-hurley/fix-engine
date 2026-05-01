@@ -151,12 +151,20 @@ pub fn plan_fixes(
                         // would incorrectly transform a substring of a dead class
                         // (e.g., pf-v5-c-expandable-section__toggle → non-existent
                         // pf-v6-c-expandable-section__toggle).
+                        //
+                        // Only check `would_produce.contains(dead)` (the result
+                        // contains a dead class as a substring). Do NOT check the
+                        // reverse (`dead.contains(would_produce)`) — that would
+                        // falsely suppress valid shorter classes when a longer dead
+                        // class happens to contain them as a prefix. For example,
+                        // `pf-v6-c-wizard__footer` is valid but would be suppressed
+                        // because dead class `pf-v6-c-wizard__footer-cancel`
+                        // contains it as a substring.
                         if !dead_css_classes.is_empty() && !matched_text.is_empty() {
                             let would_produce =
                                 matched_text.replace(old_prefix.as_str(), new_prefix.as_str());
                             if dead_css_classes.iter().any(|dead| {
                                 would_produce.contains(dead.as_str())
-                                    || dead.contains(would_produce.as_str())
                             }) {
                                 tracing::debug!(
                                     rule_id = %rule_id,
@@ -199,6 +207,7 @@ pub fn plan_fixes(
                     FixStrategy::EnsureDependency {
                         ref package,
                         ref new_version,
+                        ..
                     } => {
                         // Source file incidents (e.g., .tsx importing from the wrong
                         // package) need an import rewrite, not just a manifest update.
@@ -209,6 +218,12 @@ pub fn plan_fixes(
                             .extension()
                             .and_then(|e| e.to_str())
                             .unwrap_or("");
+                        // Java source files: skip EnsureDependency entirely.
+                        // The namespace migration handles imports via JavaImportRename;
+                        // the dependency update targets the manifest file, not .java files.
+                        if ext == "java" {
+                            continue;
+                        }
                         if matches!(ext, "tsx" | "ts" | "jsx" | "js") {
                             let mut enriched_message = incident.message.clone();
                             if let (Some(imported), Some(module)) = (
@@ -274,6 +289,40 @@ pub fn plan_fixes(
                         });
                     }
                     FixStrategy::Llm { ref context } => {
+                        let companion_test_files =
+                            lang.discover_companion_test_files(&file_path);
+
+                        // If this is a test-impact-only violation and there are
+                        // no companion test files, skip the LLM session — there
+                        // is nothing actionable to fix.
+                        let is_test_impact_only = violation
+                            .labels
+                            .iter()
+                            .any(|l| l == "change-type=test-impact")
+                            && !violation.labels.iter().any(|l| {
+                                l.starts_with("change-type=")
+                                    && l != "change-type=test-impact"
+                            });
+
+                        if is_test_impact_only && companion_test_files.is_empty() {
+                            tracing::debug!(
+                                rule_id = %rule_id,
+                                file = %file_path.display(),
+                                "Skipping test-impact violation — no companion test files"
+                            );
+                            plan.manual.push(ManualFixItem {
+                                rule_id: rule_id.clone(),
+                                file_uri: incident.file_uri.clone(),
+                                line: incident.line_number.unwrap_or(0),
+                                message: format!(
+                                    "Test-impact violation with no companion test files found. {}",
+                                    incident.message,
+                                ),
+                                code_snip: incident.code_snip.clone(),
+                            });
+                            continue;
+                        }
+
                         let mut enriched_message = incident.message.clone();
 
                         // Append incident variables as structured context
@@ -303,9 +352,84 @@ pub fn plan_fixes(
                             code_snip: incident.code_snip.clone(),
                             source: None, // filled lazily if LLM is invoked
                             labels: violation.labels.clone(),
-                            companion_test_files: lang.discover_companion_test_files(&file_path),
+                            companion_test_files,
                         });
                     }
+                }
+            }
+        }
+    }
+
+    // Proactive dependency updates: for EnsureDependency strategies that had
+    // zero matching incidents (e.g., because kantra doesn't dispatch dependency
+    // conditions to external providers), scan manifest files directly.
+    {
+        let used_dep_rule_ids: HashSet<String> = output
+            .iter()
+            .flat_map(|rs| rs.violations.keys())
+            .cloned()
+            .collect();
+
+        for (rule_id, strategy) in strategies {
+            if let FixStrategy::EnsureDependency {
+                ref package,
+                ref new_version,
+                ref old_package,
+            } = strategy
+            {
+                // Only run proactively if: (a) no incidents matched this rule,
+                // and (b) we have an old_package to search for.
+                if used_dep_rule_ids.contains(rule_id.as_str()) {
+                    continue;
+                }
+                let old_pkg = match old_package {
+                    Some(p) if !p.is_empty() => p,
+                    _ => continue,
+                };
+
+                tracing::info!(
+                    rule_id = %rule_id,
+                    old_package = %old_pkg,
+                    new_package = %package,
+                    new_version = %new_version,
+                    "Running proactive dependency update (no kantra incidents)"
+                );
+
+                let fixes = lang.plan_proactive_dependency(
+                    rule_id, old_pkg, package, new_version, project_root, report,
+                );
+                for fix in fixes {
+                    let dep_path = uri_to_path(&fix.file_uri, project_root);
+                    plan.files.entry(dep_path).or_default().push(fix);
+                }
+            }
+        }
+    }
+
+    // Config file FQN replacement: for JavaImportRename strategies, scan
+    // non-Java config files (persistence.xml, build.gradle, *.properties,
+    // *.yml, Docker configs) for FQN references and replace them. This
+    // handles cases where class FQNs appear as string literals in config
+    // files that the Java scanner doesn't scan (e.g., dialect references
+    // like `org.hibernate.dialect.MySQL5InnoDBDialect`).
+    {
+        for (rule_id, strategy) in strategies {
+            if let FixStrategy::JavaImportRename {
+                ref old_fqn,
+                ref new_fqn,
+            } = strategy
+            {
+                // Only scan config files for FQN-style patterns (must have at least
+                // 2 dots to avoid false positives from short patterns like "Criteria").
+                if old_fqn.matches('.').count() < 2 {
+                    continue;
+                }
+                let fixes = lang.plan_config_file_renames(
+                    rule_id, old_fqn, new_fqn, project_root, report,
+                );
+                for fix in fixes {
+                    let cfg_path = uri_to_path(&fix.file_uri, project_root);
+                    plan.files.entry(cfg_path).or_default().push(fix);
                 }
             }
         }
