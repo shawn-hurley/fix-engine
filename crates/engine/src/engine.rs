@@ -1435,20 +1435,34 @@ fn plan_rename(
                 }
             }
         }
-    } else if let Some(file_line) = source.lines().nth((line as usize).saturating_sub(1)) {
-        for m in mappings {
-            if m.old == m.new {
-                continue;
-            }
-            if file_line.contains(&m.old) {
-                edits.push(TextEdit {
-                    line,
-                    old_text: m.old.clone(),
-                    new_text: m.new.clone(),
-                    rule_id: rule_id.to_string(),
-                    description: format!("Rename '{}' to '{}'", m.old, m.new),
-                    replace_all: false,
-                });
+    } else {
+        // Fallback: scan a window around the incident line. The reported line
+        // may be slightly off (e.g., scanner reports the start of a multi-line
+        // template literal, but the match is a few lines later).
+        let line_idx = (line as usize).saturating_sub(1);
+        let scan_start = line_idx.saturating_sub(1);
+        let scan_end = (line_idx + 5).min(source.lines().count());
+        for (idx, file_line) in source
+            .lines()
+            .enumerate()
+            .skip(scan_start)
+            .take(scan_end - scan_start)
+        {
+            let line_num = (idx + 1) as u32;
+            for m in mappings {
+                if m.old == m.new {
+                    continue;
+                }
+                if file_line.contains(&m.old) {
+                    edits.push(TextEdit {
+                        line: line_num,
+                        old_text: m.old.clone(),
+                        new_text: m.new.clone(),
+                        rule_id: rule_id.to_string(),
+                        description: format!("Rename '{}' to '{}'", m.old, m.new),
+                        replace_all: false,
+                    });
+                }
             }
         }
     }
