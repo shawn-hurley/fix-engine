@@ -411,6 +411,10 @@ pub fn run_all_goose_fixes(
         .map(|(i, (path, reqs))| (i, path, reqs))
         .collect();
 
+    // First file runs alone to initialize goose's SQLite sessions DB,
+    // avoiding a race on CREATE TABLE schema_version.
+    let db_initialized = std::sync::Arc::new(std::sync::Barrier::new(2));
+
     // Mutex to serialize flushing of per-file log buffers so that
     // output for each file appears as a contiguous block even when
     // multiple files finish at roughly the same time.
@@ -420,12 +424,26 @@ pub fn run_all_goose_fixes(
         let mut handles = Vec::new();
 
         for (i, file_path, file_requests) in &file_entries {
+            if *i == 0 {
+                // Drain slots so first file runs exclusively
+                for _ in 1..MAX_CONCURRENT_FILES {
+                    sem_rx.recv().unwrap();
+                }
+            } else if *i == 1 {
+                db_initialized.wait();
+                // Refill semaphore slots
+                for _ in 1..MAX_CONCURRENT_FILES {
+                    sem_tx.send(()).unwrap();
+                }
+            }
+
             // Acquire semaphore slot (blocks until a slot is free)
             sem_rx.recv().unwrap();
 
             let sem_tx = sem_tx.clone();
             let ok_count = succeeded.clone();
             let fail_count = failed_count.clone();
+            let db_init = db_initialized.clone();
             let i = *i;
             let printer = printer.clone();
             let bar = bar.clone();
@@ -443,6 +461,10 @@ pub fn run_all_goose_fixes(
                     timeout_secs,
                     max_families_per_chunk,
                 );
+
+                if i == 0 {
+                    db_init.wait();
+                }
 
                 match &result {
                     r if r.success => {
