@@ -1099,6 +1099,19 @@ fn process_single_file(
     }
 }
 
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Returns true when the labels indicate a test-impact-only rule — one that
+/// describes behavioral changes affecting tests but requires no source code
+/// modifications. A rule is test-impact-only when it has `change-type=test-impact`
+/// and NO other `change-type=` labels (which would indicate a source-level fix).
+fn is_test_impact_only(labels: &[String]) -> bool {
+    labels.iter().any(|l| l == "change-type=test-impact")
+        && !labels
+            .iter()
+            .any(|l| l.starts_with("change-type=") && l != "change-type=test-impact")
+}
+
 // ── Companion test file section ────────────────────────────────────────────
 
 /// Format the companion test files section for inclusion in Goose prompts.
@@ -1310,6 +1323,25 @@ fn build_merged_prompt(
         test_command,
     );
 
+    // Test-impact-only rules describe behavioral changes that may affect tests
+    // but require no source code modifications. Adjust the instructions so the
+    // LLM treats the rule as context for test evaluation, not a source code fix.
+    let is_test_only = is_test_impact_only(&request.labels);
+
+    let step2 = if is_test_only {
+        "2. **TEST-IMPACT ONLY** — This rule describes behavioral changes in rendered \
+         sub-components that may affect tests. Do NOT modify the source file for this \
+         rule (do not add props, wrappers, or workarounds). Read the companion test \
+         files listed above and fix any test assertions that would break due to the \
+         described behavioral changes."
+            .to_string()
+    } else {
+        format!(
+            "2. Apply ONLY the change described by the migration rule at or near line {}",
+            lines_display,
+        )
+    };
+
     format!(
         r#"You are applying a {migration_desc} fix.
 
@@ -1326,7 +1358,7 @@ Code context:
 
 Instructions:
 1. Read the file at {file_path}
-2. Apply ONLY the change described by the migration rule at or near line {lines}
+{step2}
 3. Make the minimum edit necessary — do not change unrelated code, but you MUST clean up all artifacts caused by your change. Specifically: if your edit introduces a new type or component reference (e.g., MenuToggleElement, ModalHeader), ADD the import for it. If your edit makes an import binding unused, REMOVE that binding from the import statement (or remove the entire import if all bindings are unused). Similarly, delete any dead variable declarations, unused helper functions, or orphaned type imports that your change made redundant. Do NOT leave unused imports "just in case" — the file must compile and pass strict no-unused-vars linting after your edit.
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
 5. Write the fixed file. IMPORTANT: Preserve all Unicode characters exactly as they appear in the original file — do NOT normalize curly quotes (\u2018 \u2019 \u201C \u201D), em dashes (\u2014), or other non-ASCII characters to ASCII equivalents. Replacing e.g. \u2019 with ' inside a single-quoted string creates a syntax error.
@@ -1343,6 +1375,7 @@ After writing the file, produce a '## Changes Applied' section that lists the ch
         rule_id = request.rule_id,
         message = request.message,
         code_context = code_context,
+        step2 = step2,
         constraints_section = constraints_section,
     )
 }
@@ -1356,6 +1389,20 @@ fn format_fix_entry(fixes: &mut String, fix_num: usize, req: &MergedLlmFixReques
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Test-impact-only rules describe behavioral changes in sub-components
+    // that may affect tests. They should NOT cause source file modifications —
+    // the LLM should use them only as context when evaluating companion test
+    // files for breakage.
+    let test_impact_preamble = if is_test_impact_only(&req.labels) {
+        "\n**TEST-IMPACT ONLY — DO NOT modify the source file for this rule.**\n\
+         This describes a behavioral change in a rendered sub-component that may \
+         affect tests. Use this information ONLY when evaluating companion test \
+         files for breakage. Do not add props, wrappers, or workarounds to the \
+         source file based on this rule.\n"
+    } else {
+        ""
+    };
+
     if req.lines.len() == 1 {
         let code_context = req
             .code_snips
@@ -1367,7 +1414,7 @@ fn format_fix_entry(fixes: &mut String, fix_num: usize, req: &MergedLlmFixReques
 ### Fix {num}
 Line: {line}
 Rule [{rule_id}]:
-{message}
+{test_impact}{message}
 
 Code context:
 ```
@@ -1377,6 +1424,7 @@ Code context:
             num = fix_num,
             line = lines_display,
             rule_id = req.rule_id,
+            test_impact = test_impact_preamble,
             message = req.message,
             code_context = code_context,
         ));
@@ -1390,7 +1438,7 @@ Code context:
 ### Fix {num}
 Lines: {lines}
 Rule [{rule_id}]:
-{message}
+{test_impact}{message}
 
 This rule affects multiple locations in the file. Apply ALL steps together as one logical change.
 
@@ -1401,6 +1449,7 @@ Code contexts:
             num = fix_num,
             lines = lines_display,
             rule_id = req.rule_id,
+            test_impact = test_impact_preamble,
             message = req.message,
             all_snippets = all_snippets,
         ));
@@ -1502,11 +1551,31 @@ fn build_batch_prompt_with_context(
         .map(|v| format!("\n{}\n", v))
         .unwrap_or_default();
 
+    // For files with many violations (10+), add a preamble suggesting the file may need
+    // a complete rewrite or deletion rather than individual fixes.
+    let high_violation_preamble = if requests.len() >= 10 {
+        format!(
+            "\n## IMPORTANT: This file has {} violations\n\n\
+             This many violations often means the file wraps an API that was \
+             completely removed and needs a full rewrite rather than individual \
+             fixes. Before processing each fix individually:\n\
+             1. Check if ANY other file in the project references this class by name \
+             (search for the class name in imports of other files).\n\
+             2. If no other file references it, this file is dead code — **delete it entirely**.\n\
+             3. If a factory or caller references a replacement class that doesn't exist, \
+             **create that replacement class** as a new file in the same package.\n\
+             4. Only apply individual fixes if the class has external callers and can't be deleted.\n\n",
+            requests.len(),
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"You are applying {migration_desc} fixes to a single file.
 
 File: {file_path}
-{test_files_section}{context_section}
+{test_files_section}{context_section}{high_violation_preamble}
 Apply ALL of the following {count} fixes to this file:
 {fixes}
 Instructions:
@@ -1864,5 +1933,128 @@ mod tests {
         let section = result.unwrap();
         assert!(section.contains("Fixed Modal"));
         assert!(!section.contains("Additional Notes"));
+    }
+
+    // ── is_test_impact_only tests ───────────────────────────────────
+
+    #[test]
+    fn test_is_test_impact_only_true() {
+        let labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=test-impact".to_string(),
+            "impact=frontend-testing".to_string(),
+        ];
+        assert!(is_test_impact_only(&labels));
+    }
+
+    #[test]
+    fn test_is_test_impact_only_false_no_label() {
+        let labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=rename".to_string(),
+        ];
+        assert!(!is_test_impact_only(&labels));
+    }
+
+    #[test]
+    fn test_is_test_impact_only_false_mixed() {
+        // Has both test-impact AND another change-type — not test-only.
+        let labels = vec![
+            "change-type=test-impact".to_string(),
+            "change-type=prop-to-child".to_string(),
+        ];
+        assert!(!is_test_impact_only(&labels));
+    }
+
+    // ── test-impact prompt constraint tests ──────────────────────────
+
+    #[test]
+    fn test_merged_prompt_test_impact_only_has_constraint() {
+        let mut req = make_req("sd-test-tooltip-transitive-behavioral-changes");
+        req.labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=test-impact".to_string(),
+            "impact=frontend-testing".to_string(),
+        ];
+        req.companion_test_files = vec![PathBuf::from("/tmp/__tests__/test.spec.tsx")];
+        let refs = vec![&req];
+        let merged = merge_by_rule_id(&refs);
+
+        let ctx = crate::context::GenericFixContext;
+        let prompt = build_merged_prompt(&merged[0], &ctx, None);
+
+        assert!(
+            prompt.contains("TEST-IMPACT ONLY"),
+            "prompt should contain TEST-IMPACT ONLY constraint for test-impact rules"
+        );
+        assert!(
+            prompt.contains("Do NOT modify the source file"),
+            "prompt should instruct not to modify source file"
+        );
+        assert!(
+            !prompt.contains("Apply ONLY the change described"),
+            "prompt should NOT contain the standard 'apply change' instruction"
+        );
+    }
+
+    #[test]
+    fn test_merged_prompt_source_change_has_no_test_impact_constraint() {
+        let mut req = make_req("semver-modal-prop-to-child");
+        req.labels = vec![
+            "source=semver-analyzer".to_string(),
+            "change-type=prop-to-child".to_string(),
+        ];
+        let refs = vec![&req];
+        let merged = merge_by_rule_id(&refs);
+
+        let ctx = crate::context::GenericFixContext;
+        let prompt = build_merged_prompt(&merged[0], &ctx, None);
+
+        assert!(
+            !prompt.contains("TEST-IMPACT ONLY"),
+            "prompt should NOT contain test-impact constraint for source-change rules"
+        );
+        assert!(
+            prompt.contains("Apply ONLY the change described"),
+            "prompt should contain the standard 'apply change' instruction"
+        );
+    }
+
+    #[test]
+    fn test_batch_prompt_test_impact_entry_has_preamble() {
+        let mut req_source = make_req("semver-text-import-deprecated");
+        req_source.labels = vec!["change-type=rename".to_string()];
+
+        let mut req_test = make_req("sd-test-tooltip-transitive-behavioral-changes");
+        req_test.labels = vec!["change-type=test-impact".to_string()];
+        req_test.companion_test_files = vec![PathBuf::from("/tmp/__tests__/test.spec.tsx")];
+
+        let reqs = vec![&req_source, &req_test];
+        let merged = merge_by_rule_id(&reqs);
+        let merged_refs: Vec<&MergedLlmFixRequest> = merged.iter().collect();
+
+        let ctx = crate::context::GenericFixContext;
+        let prompt = build_batch_prompt_with_context(
+            &PathBuf::from("/tmp/test.tsx"),
+            &merged_refs,
+            None,
+            &ctx,
+            None,
+        );
+
+        // The batch prompt should contain the preamble for the test-impact entry
+        assert!(
+            prompt.contains("TEST-IMPACT ONLY"),
+            "batch prompt should contain TEST-IMPACT ONLY for test-impact rules"
+        );
+        assert!(
+            prompt.contains("DO NOT modify the source file for this rule"),
+            "batch prompt should say not to modify source for test-impact rules"
+        );
+        // But the source-change rule should NOT have the preamble
+        assert!(
+            prompt.contains("semver-text-import-deprecated"),
+            "batch prompt should still include the source-change rule"
+        );
     }
 }
