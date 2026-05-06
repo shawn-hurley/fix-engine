@@ -15,3 +15,4 @@ pub mod language;
 pub mod llm_client;
 pub mod progress;
 pub mod registry;
+pub mod syntax_check;

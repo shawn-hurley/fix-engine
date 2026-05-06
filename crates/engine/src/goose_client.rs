@@ -585,6 +585,46 @@ fn process_single_file(
 
     let file_start = std::time::Instant::now();
 
+    // ── Pre-fix snapshot & baseline syntax check ──────────────────────────
+    //
+    // Snapshot the main file and companion test files before the LLM touches
+    // them. After all chunks complete we run the OXC parser again — if the
+    // LLM introduced syntax errors (e.g. normalising a Unicode curly
+    // apostrophe U+2019 → ASCII U+0027 inside a single-quoted string) we
+    // restore the originals and mark the fix as failed.
+    let pre_fix_snapshot: Option<String> = std::fs::read_to_string(file_path).ok();
+    let pre_fix_errors = crate::syntax_check::check_syntax(file_path).unwrap_or_default();
+
+    // Collect unique companion test files across all requests and snapshot
+    // their content so we can restore them if the LLM breaks them.
+    let companion_test_files: Vec<PathBuf> = {
+        let mut files: Vec<PathBuf> = file_requests
+            .iter()
+            .flat_map(|r| r.companion_test_files.iter().cloned())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    };
+    let companion_snapshots: Vec<(PathBuf, String)> = companion_test_files
+        .iter()
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|content| (p.clone(), content))
+        })
+        .collect();
+    let companion_pre_fix_errors: std::collections::HashMap<PathBuf, Vec<String>> =
+        companion_test_files
+            .iter()
+            .map(|p| {
+                (
+                    p.clone(),
+                    crate::syntax_check::check_syntax(p).unwrap_or_default(),
+                )
+            })
+            .collect();
+
     // Split large batches into chunks to avoid overwhelming the LLM.
     // Each chunk runs sequentially — the LLM reads the file as modified
     // by the previous chunk. A context summary of previously applied
@@ -961,6 +1001,36 @@ fn process_single_file(
         }
     }
 
+    // ── Post-fix syntax validation ──────────────────────────────────────
+    //
+    // If the LLM reported success, parse the file(s) it wrote and compare
+    // against the baseline. Any *new* syntax error is a regression — the
+    // most common cause is Unicode normalisation (e.g. curly apostrophe →
+    // ASCII apostrophe breaking a single-quoted string). When a regression
+    // is detected we restore every snapshotted file and flip success→false.
+    if let Ok(ref r) = result {
+        if r.success {
+            let (syntax_ok, validation_log) = validate_post_fix(
+                file_path,
+                &pre_fix_snapshot,
+                &pre_fix_errors,
+                &companion_snapshots,
+                &companion_pre_fix_errors,
+            );
+            log.extend(validation_log);
+            if !syntax_ok {
+                result = Ok(GooseFixResult {
+                    file_path: file_path.to_path_buf(),
+                    rule_id: r.rule_id.clone(),
+                    success: false,
+                    output: "Syntax regression detected — restored original file(s)"
+                        .to_string(),
+                    timed_out: false,
+                });
+            }
+        }
+    }
+
     let elapsed = file_start.elapsed();
 
     match result {
@@ -1097,6 +1167,121 @@ fn process_single_file(
             }, log)
         }
     }
+}
+
+// ── Post-fix syntax validation ─────────────────────────────────────────────
+
+/// Validate that the LLM did not introduce syntax errors.
+///
+/// Compares the pre-fix error set with a fresh parse of the post-fix file.
+/// Only flags *new* errors — files that already had syntax errors before the
+/// LLM ran are not penalised for pre-existing problems.
+///
+/// When a regression is detected every snapshotted file is restored to its
+/// pre-fix content and the function returns `(false, log_lines)`.
+fn validate_post_fix(
+    file_path: &std::path::Path,
+    pre_fix_snapshot: &Option<String>,
+    pre_fix_errors: &[String],
+    companion_snapshots: &[(PathBuf, String)],
+    companion_pre_fix_errors: &std::collections::HashMap<PathBuf, Vec<String>>,
+) -> (bool, Vec<String>) {
+    use crate::syntax_check;
+
+    let mut log = Vec::new();
+    let mut has_regressions = false;
+
+    // ── Main file ──────────────────────────────────────────────────────
+    if syntax_check::is_checkable(file_path) {
+        let post_errors = syntax_check::check_syntax(file_path).unwrap_or_default();
+
+        // If the file was clean before and now has errors → regression.
+        // When the file already had errors we cannot reliably distinguish
+        // shifted pre-existing errors from genuinely new ones, so we only
+        // flag the clear-cut "was clean, now broken" case.
+        if pre_fix_errors.is_empty() && !post_errors.is_empty() {
+            has_regressions = true;
+            let name = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_path.display().to_string());
+            log.push(format!(
+                "         {}: SYNTAX REGRESSION — {} error(s) introduced by LLM fix",
+                name,
+                post_errors.len()
+            ));
+            for err in &post_errors {
+                log.push(format!("           {}", err));
+            }
+        }
+    }
+
+    // ── Companion test files ───────────────────────────────────────────
+    for (path, pre_content) in companion_snapshots {
+        if !syntax_check::is_checkable(path) {
+            continue;
+        }
+        // Only validate if the file was actually modified by the LLM.
+        let current = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if &current == pre_content {
+            continue; // Unchanged — nothing to validate.
+        }
+
+        let pre_errors = companion_pre_fix_errors
+            .get(path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let post_errors = syntax_check::check_syntax(path).unwrap_or_default();
+
+        if pre_errors.is_empty() && !post_errors.is_empty() {
+            has_regressions = true;
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            log.push(format!(
+                "         {}: SYNTAX REGRESSION — {} error(s) in companion test file",
+                name,
+                post_errors.len()
+            ));
+            for err in &post_errors {
+                log.push(format!("           {}", err));
+            }
+        }
+    }
+
+    // ── Restore originals on regression ────────────────────────────────
+    if has_regressions {
+        log.push("         Restoring pre-fix file(s)...".to_string());
+        if let Some(original) = pre_fix_snapshot {
+            if std::fs::write(file_path, original).is_ok() {
+                log.push(format!(
+                    "         ✓ Restored {}",
+                    file_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ));
+            }
+        }
+        for (path, content) in companion_snapshots {
+            // Only restore files that were actually modified.
+            let current = std::fs::read_to_string(path).unwrap_or_default();
+            if current != *content {
+                if std::fs::write(path, content).is_ok() {
+                    log.push(format!(
+                        "         ✓ Restored {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+
+    (!has_regressions, log)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -2056,5 +2241,139 @@ mod tests {
             prompt.contains("semver-text-import-deprecated"),
             "batch prompt should still include the source-change rule"
         );
+    }
+
+    // ── validate_post_fix tests ─────────────────────────────────────
+
+    #[test]
+    fn test_validate_post_fix_clean_file_stays_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Good.tsx");
+        let original = "export const App = () => <div>Hello</div>;\n";
+        std::fs::write(&file, original).unwrap();
+
+        let pre_errors = crate::syntax_check::check_syntax(&file).unwrap();
+        assert!(pre_errors.is_empty());
+
+        // File unchanged → no regression.
+        let (ok, log) = validate_post_fix(
+            &file,
+            &Some(original.to_string()),
+            &pre_errors,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        assert!(ok, "unchanged clean file should pass: {:?}", log);
+    }
+
+    #[test]
+    fn test_validate_post_fix_detects_unicode_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Welcome.tsx");
+
+        // Original has curly apostrophe (U+2019) — valid JS.
+        let original = "const x = 'Let\u{2019}s get started.';\n";
+        std::fs::write(&file, original).unwrap();
+
+        let pre_errors = crate::syntax_check::check_syntax(&file).unwrap();
+        assert!(
+            pre_errors.is_empty(),
+            "curly apostrophe should be valid: {:?}",
+            pre_errors
+        );
+
+        // LLM normalizes curly apostrophe → ASCII apostrophe — broken JS.
+        let broken = "const x = 'Let's get started.';\n";
+        std::fs::write(&file, broken).unwrap();
+
+        let (ok, log) = validate_post_fix(
+            &file,
+            &Some(original.to_string()),
+            &pre_errors,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        assert!(!ok, "should detect syntax regression");
+        assert!(
+            log.iter().any(|l| l.contains("SYNTAX REGRESSION")),
+            "log should mention syntax regression: {:?}",
+            log
+        );
+
+        // Should have restored the original.
+        let restored = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(restored, original, "original should be restored");
+    }
+
+    #[test]
+    fn test_validate_post_fix_ignores_pre_existing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("AlreadyBroken.tsx");
+
+        // File starts with a syntax error.
+        let original = "const x = 'already broken;\n";
+        std::fs::write(&file, original).unwrap();
+
+        let pre_errors = crate::syntax_check::check_syntax(&file).unwrap();
+        assert!(!pre_errors.is_empty());
+
+        // File still has errors after LLM — but pre-existing errors
+        // should NOT trigger a regression.
+        let (ok, _log) = validate_post_fix(
+            &file,
+            &Some(original.to_string()),
+            &pre_errors,
+            &[],
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            ok,
+            "pre-existing errors should not count as a regression"
+        );
+    }
+
+    #[test]
+    fn test_validate_post_fix_restores_companion_test_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_file = dir.path().join("Component.tsx");
+        let test_file = dir.path().join("Component.test.tsx");
+
+        let main_original = "export const Foo = () => <div />;\n";
+        let test_original = "import { Foo } from './Component';\n";
+
+        std::fs::write(&main_file, main_original).unwrap();
+        std::fs::write(&test_file, test_original).unwrap();
+
+        let pre_main_errors = crate::syntax_check::check_syntax(&main_file).unwrap();
+        let pre_test_errors = crate::syntax_check::check_syntax(&test_file).unwrap();
+        assert!(pre_main_errors.is_empty());
+        assert!(pre_test_errors.is_empty());
+
+        let mut companion_pre = std::collections::HashMap::new();
+        companion_pre.insert(test_file.clone(), pre_test_errors);
+        let companion_snapshots = vec![(test_file.clone(), test_original.to_string())];
+
+        // LLM breaks the test file.
+        let broken_test = "import { Foo from './Component';\n";
+        std::fs::write(&test_file, broken_test).unwrap();
+
+        let (ok, log) = validate_post_fix(
+            &main_file,
+            &Some(main_original.to_string()),
+            &pre_main_errors,
+            &companion_snapshots,
+            &companion_pre,
+        );
+        assert!(!ok, "should detect companion file regression");
+        assert!(
+            log.iter()
+                .any(|l| l.contains("companion test file")),
+            "log should mention companion test: {:?}",
+            log
+        );
+
+        // Test file should be restored.
+        let restored = std::fs::read_to_string(&test_file).unwrap();
+        assert_eq!(restored, test_original);
     }
 }
