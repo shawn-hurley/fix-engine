@@ -50,7 +50,8 @@ impl LanguageFixProvider for JavaFixProvider {
         })
     }
 
-    fn post_process_lines(&self, lines: &mut [String]) {
+    fn post_process_lines(&self, lines: &mut Vec<String>) {
+        resolve_pending_imports(lines);
         dedup_java_imports(lines);
     }
 
@@ -95,6 +96,27 @@ impl LanguageFixProvider for JavaFixProvider {
             || incident.variables.contains_key("module")
     }
 
+    fn plan_annotation_param_rewrite(
+        &self,
+        rule_id: &str,
+        incident: &Incident,
+        old_param: &str,
+        new_param: &str,
+        value_transform: &str,
+        file_path: &Path,
+        report: &mut FixReport,
+    ) -> Option<PlannedFix> {
+        plan_java_annotation_param_rewrite(
+            rule_id,
+            incident,
+            old_param,
+            new_param,
+            value_transform,
+            file_path,
+            report,
+        )
+    }
+
     fn plan_import_rename(
         &self,
         rule_id: &str,
@@ -110,9 +132,119 @@ impl LanguageFixProvider for JavaFixProvider {
     fn discover_companion_test_files(&self, file_path: &Path) -> Vec<PathBuf> {
         discover_java_companion_test_files(file_path)
     }
+
+    fn plan_proactive_dependency(
+        &self,
+        rule_id: &str,
+        old_package: &str,
+        new_package: &str,
+        new_version: &str,
+        project_root: &Path,
+        report: &mut FixReport,
+    ) -> Vec<PlannedFix> {
+        plan_proactive_java_dependency(
+            rule_id,
+            old_package,
+            new_package,
+            new_version,
+            project_root,
+            report,
+        )
+    }
+
+    fn plan_config_file_renames(
+        &self,
+        rule_id: &str,
+        old_fqn: &str,
+        new_fqn: &str,
+        project_root: &Path,
+        report: &mut FixReport,
+    ) -> Vec<PlannedFix> {
+        plan_config_file_fqn_renames(rule_id, old_fqn, new_fqn, project_root, report)
+    }
 }
 
 // ── Import deduplication ───────────────────────────────────────────────────
+
+/// Resolve `// __ADD_IMPORT:fqn` markers left by `AnnotationParamRewrite`.
+///
+/// Markers are embedded in annotation rewrite edits to avoid edit conflicts
+/// with namespace migration edits on import lines. This function runs in
+/// post-processing after all edits are applied:
+/// 1. Scans all lines for `// __ADD_IMPORT:fqn` markers
+/// 2. Strips markers from the lines
+/// 3. Inserts missing imports after the last existing import line
+fn resolve_pending_imports(lines: &mut Vec<String>) {
+    let mut fqns_to_add: Vec<String> = Vec::new();
+
+    // Scan for markers and strip them
+    for line in lines.iter_mut() {
+        let mut remaining = line.as_str();
+        while let Some(marker_pos) = remaining.find("// __ADD_IMPORT:") {
+            let after_marker = &remaining[marker_pos + "// __ADD_IMPORT:".len()..];
+            // Extract the FQN (up to next space, marker, or end of line)
+            let fqn_end = after_marker
+                .find(" // __ADD_IMPORT:")
+                .unwrap_or(after_marker.len());
+            let fqn = after_marker[..fqn_end].trim().to_string();
+            if !fqn.is_empty() {
+                fqns_to_add.push(fqn);
+            }
+            remaining = &remaining[..marker_pos];
+        }
+
+        // Strip all markers from this line
+        if let Some(pos) = line.find(" // __ADD_IMPORT:") {
+            line.truncate(pos);
+        }
+    }
+
+    if fqns_to_add.is_empty() {
+        return;
+    }
+
+    // Dedup
+    fqns_to_add.sort();
+    fqns_to_add.dedup();
+
+    // Find existing imports to avoid duplicates
+    let existing_imports: std::collections::HashSet<String> = lines
+        .iter()
+        .filter(|l| {
+            let t = l.trim();
+            t.starts_with("import ") && t.ends_with(';')
+        })
+        .map(|l| l.trim().to_string())
+        .collect();
+
+    // Filter out already-imported FQNs
+    let new_imports: Vec<String> = fqns_to_add
+        .into_iter()
+        .filter(|fqn| !existing_imports.contains(&format!("import {};", fqn)))
+        .map(|fqn| format!("import {};", fqn))
+        .collect();
+
+    if new_imports.is_empty() {
+        return;
+    }
+
+    // Find insertion point: after the last import line
+    let insert_after = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, l)| {
+            let t = l.trim();
+            t.starts_with("import ") && t.ends_with(';')
+        })
+        .map(|(i, _)| i + 1)
+        .unwrap_or(1); // After package declaration if no imports
+
+    // Insert the new imports
+    for (offset, imp) in new_imports.into_iter().enumerate() {
+        lines.insert(insert_after + offset, imp);
+    }
+}
 
 /// Deduplicate Java import statements.
 ///
@@ -300,6 +432,172 @@ fn replace_at_word_boundary(line: &str, old: &str, new: &str) -> Option<String> 
     if changed { Some(result) } else { None }
 }
 
+// ── Annotation parameter rewrite ───────────────────────────────────────────
+
+/// Plan a Java annotation parameter rewrite.
+///
+/// Rewrites annotation element names and optionally transforms values.
+/// For example: `@Type(type = "com.example.Foo")` → `@Type(value = Foo.class)`.
+///
+/// Supports two value transforms:
+/// - `StringFqnToClassLiteral`: `"com.example.Foo"` → `Foo.class`
+///   Also adds `import com.example.Foo;` if not already present.
+///   Falls through to `None` if the referenced class doesn't exist (e.g.,
+///   built-in types that were removed), allowing the LLM phase to handle it.
+/// - `Identity`: keep the value as-is, just rename the element name.
+fn plan_java_annotation_param_rewrite(
+    rule_id: &str,
+    incident: &Incident,
+    old_param: &str,
+    new_param: &str,
+    value_transform: &str,
+    file_path: &Path,
+    report: &mut FixReport,
+) -> Option<PlannedFix> {
+    let source = std::fs::read_to_string(file_path).ok()?;
+    let source_lines: Vec<&str> = source.lines().collect();
+
+    let line_num = incident.line_number.unwrap_or(0);
+    if line_num == 0 || source_lines.is_empty() {
+        return None;
+    }
+
+    // Build a regex to match the annotation parameter.
+    // Pattern: old_param = "value"
+    let param_re = regex::Regex::new(&format!(
+        r#"{}(\s*=\s*)"([^"]+)""#,
+        regex::escape(old_param)
+    ))
+    .ok()?;
+
+    // The incident fires on the IMPORT line, not the annotation usage.
+    // Scan the ENTIRE file for annotation usages matching the pattern.
+    let mut edits = Vec::new();
+    let mut imports_to_add = std::collections::HashSet::new();
+
+    for idx in 0..source_lines.len() {
+        let line = source_lines[idx];
+        // Quick check: must contain the old param and look like an annotation line
+        if !line.contains(old_param) {
+            continue;
+        }
+        if let Some(caps) = param_re.captures(line) {
+            let spacing = &caps[1]; // the " = " part
+            let fqn_value = &caps[2]; // the FQN string value
+
+            let new_line = match value_transform {
+                "StringFqnToClassLiteral" => {
+                    // Extract simple class name from FQN
+                    let simple_name = fqn_value.rsplit('.').next().unwrap_or(fqn_value);
+
+                    // Build the replacement: old_param = "fqn" → new_param = SimpleName.class
+                    let old_text = format!(
+                        "{}{}\"{}\"",
+                        old_param, spacing, fqn_value
+                    );
+                    let new_text = format!("{}{}{}.class", new_param, spacing, simple_name);
+                    line.replace(&old_text, &new_text)
+                }
+                _ => {
+                    // Identity: just rename the parameter, keep the value
+                    line.replacen(old_param, new_param, 1)
+                }
+            };
+
+            if new_line != line {
+                edits.push(TextEdit {
+                    line: (idx + 1) as u32,
+                    old_text: line.to_string(),
+                    new_text: new_line,
+                    rule_id: rule_id.to_string(),
+                    description: format!(
+                        "Rewrite annotation param: {} → {}",
+                        old_param, new_param
+                    ),
+                    replace_all: false,
+                });
+            }
+
+            // For StringFqnToClassLiteral, check if the referenced class still exists.
+            // Library types (org.hibernate.*) may have been removed in the new version —
+            // fall through to LLM for these so it can determine the correct replacement
+            // (e.g., NumericBooleanType → @JdbcTypeCode, yes_no → @Convert).
+            if value_transform == "StringFqnToClassLiteral" {
+                let fqn_value_str = fqn_value.to_string();
+                // A consumer class must be a FQN (contains dots) and not a library type.
+                // Short names without dots (e.g., "yes_no") are Hibernate shorthand type
+                // names that should fall through to LLM.
+                let is_consumer_class = fqn_value_str.contains('.')
+                    && (fqn_value_str.contains("candlepin")
+                        || fqn_value_str.contains("redhat")
+                        || !fqn_value_str.starts_with("org.hibernate"));
+
+                if is_consumer_class {
+                    let import_line = format!("import {};", fqn_value_str);
+                    let already_imported = source_lines
+                        .iter()
+                        .any(|l| l.trim() == import_line);
+
+                    if !already_imported {
+                        imports_to_add.insert(fqn_value_str);
+                    }
+                } else {
+                    // Library type — the class may not exist in the new version.
+                    // Don't rewrite this annotation; let the LLM handle it.
+                    tracing::debug!(
+                        rule_id = %rule_id,
+                        fqn = %fqn_value_str,
+                        "Annotation value references library type — skipping pattern fix for LLM"
+                    );
+                    // Remove the edit we just added for this line
+                    edits.retain(|e| e.line != (idx + 1) as u32);
+                }
+            }
+        }
+    }
+
+    // Add import markers to the FIRST annotation rewrite edit.
+    // These markers are resolved by post_process_lines (resolve_pending_imports)
+    // AFTER all edits are applied, avoiding conflicts with namespace migration
+    // edits that may target the same import lines.
+    if !imports_to_add.is_empty() {
+        if let Some(first_edit) = edits.first_mut() {
+            for fqn in &imports_to_add {
+                first_edit
+                    .new_text
+                    .push_str(&format!(" // __ADD_IMPORT:{}", fqn));
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        report.record_skip(
+            rule_id,
+            &incident.file_uri,
+            Some(line_num),
+            SkipReason::TextNotFound,
+            Some(format!(
+                "Annotation param '{}' not found near line {}",
+                old_param, line_num
+            )),
+        );
+        return None;
+    }
+
+    Some(PlannedFix {
+        rule_id: rule_id.to_string(),
+        file_uri: incident.file_uri.clone(),
+        line: line_num,
+        description: format!(
+            "Rewrite annotation: {} → {} ({})",
+            old_param, new_param, value_transform
+        ),
+        edits,
+        source: FixSource::Pattern,
+        confidence: FixConfidence::High,
+    })
+}
+
 // ── Annotation removal ─────────────────────────────────────────────────────
 
 /// Plan removal of a Java annotation from a source file.
@@ -429,6 +727,283 @@ fn plan_ensure_java_dependency(
     // TODO: Implement pom.xml and build.gradle dependency version updates.
     // For now, dependency fixes are routed to LLM-assisted fixing or manual review.
     Vec::new()
+}
+
+/// Proactively scan Gradle/Maven manifest files for a dependency to update.
+///
+/// Called when no kantra incidents matched an `EnsureDependency` rule (e.g., because
+/// kantra doesn't dispatch dependency conditions to external providers). Scans the
+/// project root for `dependencies.gradle`, `build.gradle`, and `pom.xml` files
+/// containing `old_package` and produces text edits to replace the coordinate.
+///
+/// `old_package` can be:
+/// - A Maven coordinate prefix: `"org.hibernate:hibernate-c3p0"` → matches `"org.hibernate:hibernate-c3p0:5.6.15.Final"`
+/// - A Java package name: `"javax.persistence"` → matches `"org.hibernate.javax.persistence:..."` (substring)
+fn plan_proactive_java_dependency(
+    rule_id: &str,
+    old_package: &str,
+    new_package: &str,
+    new_version: &str,
+    project_root: &Path,
+    report: &mut FixReport,
+) -> Vec<PlannedFix> {
+    let mut fixes = Vec::new();
+
+    // Find manifest files
+    let manifest_names = [
+        "dependencies.gradle",
+        "build.gradle",
+        "build.gradle.kts",
+        "pom.xml",
+    ];
+
+    let mut manifest_files = Vec::new();
+    // Search project root and immediate subdirectories
+    for name in &manifest_names {
+        let path = project_root.join(name);
+        if path.exists() {
+            manifest_files.push(path);
+        }
+    }
+    // Also check common subdirectories
+    if let Ok(entries) = std::fs::read_dir(project_root) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                for name in &manifest_names {
+                    let path = entry.path().join(name);
+                    if path.exists() {
+                        manifest_files.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    for manifest_path in &manifest_files {
+        let source = match std::fs::read_to_string(manifest_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let source_lines: Vec<&str> = source.lines().collect();
+        let mut edits = Vec::new();
+
+        for (idx, line) in source_lines.iter().enumerate() {
+            // Check if this line contains the old package/coordinate
+            if !line.contains(old_package) {
+                continue;
+            }
+
+            // For Maven coordinates (e.g., "org.hibernate:hibernate-c3p0"),
+            // replace the coordinate + version
+            if old_package.contains(':') {
+                // old_package is a Maven coordinate like "org.hibernate:hibernate-c3p0"
+                // new_package is like "org.hibernate.orm:hibernate-c3p0"
+                // We need to also update the version
+                let new_line = if new_package.contains(':') {
+                    // Replace group:artifact and update version
+                    let replaced = line.replace(old_package, new_package);
+                    // Try to update the version in the same line
+                    // Gradle format: "group:artifact:version"
+                    if let Some(old_version_start) =
+                        replaced.find(new_package).map(|p| p + new_package.len())
+                    {
+                        let after = &replaced[old_version_start..];
+                        if after.starts_with(':') {
+                            // Find the old version (between : and " or ')
+                            if let Some(end) =
+                                after[1..].find(|c: char| c == '"' || c == '\'')
+                            {
+                                let old_ver = &after[1..1 + end];
+                                replaced.replace(
+                                    &format!("{}:{}", new_package, old_ver),
+                                    &format!("{}:{}", new_package, new_version),
+                                )
+                            } else {
+                                replaced
+                            }
+                        } else {
+                            replaced
+                        }
+                    } else {
+                        replaced
+                    }
+                } else {
+                    line.replace(old_package, new_package)
+                };
+
+                if new_line != *line {
+                    edits.push(TextEdit {
+                        line: (idx + 1) as u32,
+                        old_text: line.to_string(),
+                        new_text: new_line,
+                        rule_id: rule_id.to_string(),
+                        description: format!("Update dependency: {} → {}:{}", old_package, new_package, new_version),
+                        replace_all: false,
+                    });
+                }
+            } else {
+                // old_package is a Java namespace like "javax.persistence"
+                // The Gradle line might look like:
+                //   libraries["hibernate"] = "org.hibernate.javax.persistence:hibernate-jpa-2.1-api:1.0.2.Final"
+                // We need to replace the ENTIRE coordinate with the new one.
+                // new_package format: "jakarta.persistence:jakarta.persistence-api"
+                if new_package.contains(':') {
+                    // Find the quoted coordinate in the line
+                    let coord_re = regex::Regex::new(r#""([^"]+:[^"]+:[^"]+)""#).ok();
+                    if let Some(re) = coord_re {
+                        if let Some(caps) = re.captures(line) {
+                            let full_coord = &caps[1];
+                            if full_coord.contains(old_package) {
+                                let new_coord = format!("{}:{}", new_package, new_version);
+                                let new_line = line.replace(full_coord, &new_coord);
+                                if new_line != *line {
+                                    edits.push(TextEdit {
+                                        line: (idx + 1) as u32,
+                                        old_text: line.to_string(),
+                                        new_text: new_line,
+                                        rule_id: rule_id.to_string(),
+                                        description: format!(
+                                            "Update dependency: {} → {}:{}",
+                                            full_coord, new_package, new_version
+                                        ),
+                                        replace_all: false,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !edits.is_empty() {
+            let file_uri = format!("file://{}", manifest_path.display());
+            tracing::info!(
+                rule_id = %rule_id,
+                file = %manifest_path.display(),
+                edits = edits.len(),
+                "Proactive dependency update"
+            );
+            fixes.push(PlannedFix {
+                rule_id: rule_id.to_string(),
+                file_uri,
+                line: edits[0].line,
+                description: format!(
+                    "Proactive dependency update: {} → {}:{}",
+                    old_package, new_package, new_version
+                ),
+                edits,
+                source: FixSource::Pattern,
+                confidence: FixConfidence::High,
+            });
+        }
+    }
+
+    if fixes.is_empty() {
+        report.record_skip(
+            rule_id,
+            &format!("file://{}", project_root.display()),
+            None,
+            SkipReason::TextNotFound,
+            Some(format!(
+                "No manifest file found containing '{}'",
+                old_package
+            )),
+        );
+    }
+
+    fixes
+}
+
+/// Scan config files for FQN string references and replace them.
+///
+/// Handles persistence.xml, application.properties, hibernate.cfg.xml,
+/// and other config files that contain class FQN strings.
+fn plan_config_file_fqn_renames(
+    rule_id: &str,
+    old_fqn: &str,
+    new_fqn: &str,
+    project_root: &Path,
+    report: &mut FixReport,
+) -> Vec<PlannedFix> {
+    let mut fixes = Vec::new();
+    let config_extensions = ["xml", "properties", "yml", "yaml", "cfg", "conf"];
+
+    // Walk src/main/resources and project root for config files
+    let search_dirs = [
+        project_root.join("src/main/resources"),
+        project_root.join("src/main/resources/META-INF"),
+        project_root.to_path_buf(),
+    ];
+
+    for dir in &search_dirs {
+        if !dir.exists() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if !config_extensions.contains(&ext) {
+                continue;
+            }
+
+            let source = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            if !source.contains(old_fqn) {
+                continue;
+            }
+
+            let source_lines: Vec<&str> = source.lines().collect();
+            let mut edits = Vec::new();
+
+            for (idx, line) in source_lines.iter().enumerate() {
+                if line.contains(old_fqn) {
+                    let new_line = line.replace(old_fqn, new_fqn);
+                    if new_line != *line {
+                        edits.push(TextEdit {
+                            line: (idx + 1) as u32,
+                            old_text: line.to_string(),
+                            new_text: new_line,
+                            rule_id: rule_id.to_string(),
+                            description: format!("Replace FQN: {} → {}", old_fqn, new_fqn),
+                            replace_all: false,
+                        });
+                    }
+                }
+            }
+
+            if !edits.is_empty() {
+                let file_uri = format!("file://{}", path.display());
+                fixes.push(PlannedFix {
+                    rule_id: rule_id.to_string(),
+                    file_uri,
+                    line: edits[0].line,
+                    description: format!("Config file FQN rename: {} → {}", old_fqn, new_fqn),
+                    edits,
+                    source: FixSource::Pattern,
+                    confidence: FixConfidence::High,
+                });
+            }
+        }
+    }
+
+    let _ = report; // Suppress unused warning
+    fixes
 }
 
 // ── Incident variable extraction ───────────────────────────────────────────
@@ -784,5 +1359,186 @@ mod tests {
         // Underscore is NOT a word boundary (part of identifier)
         let result = replace_at_word_boundary("my_read_method()", "read", "extract");
         assert_eq!(result, None);
+    }
+
+    // ── Annotation param rewrite tests ─────────────────────────────────────
+
+    #[test]
+    fn test_annotation_param_rewrite_string_fqn_to_class_literal() {
+        // Test the core case: @Type(type = "com.example.MyType") → @Type(value = MyType.class)
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Foo.java");
+        std::fs::write(
+            &file,
+            r#"package com.example;
+
+import org.hibernate.annotations.Type;
+
+public class Foo {
+    @Type(type = "org.candlepin.hibernate.EmptyStringUserType")
+    private String name;
+}
+"#,
+        )
+        .unwrap();
+
+        let incident = Incident {
+            file_uri: format!("file://{}", file.display()),
+            line_number: Some(6),
+            code_location: None,
+            message: String::new(),
+            code_snip: None,
+            variables: BTreeMap::new(),
+            effort: None,
+            links: Vec::new(),
+            is_dependency_incident: false,
+        };
+        let mut report = FixReport::new();
+
+        let fix = plan_java_annotation_param_rewrite(
+            "test-rule",
+            &incident,
+            "type",
+            "value",
+            "StringFqnToClassLiteral",
+            &file,
+            &mut report,
+        );
+
+        assert!(fix.is_some(), "Expected a planned fix");
+        let fix = fix.unwrap();
+        assert_eq!(fix.source, FixSource::Pattern);
+        assert_eq!(fix.confidence, FixConfidence::High);
+
+        // Should have at least an annotation rewrite edit
+        let annotation_edit = fix
+            .edits
+            .iter()
+            .find(|e| e.description.contains("Rewrite annotation param"));
+        assert!(annotation_edit.is_some(), "Missing annotation param edit");
+        let edit = annotation_edit.unwrap();
+        assert!(
+            edit.new_text.contains("value = EmptyStringUserType.class"),
+            "Expected class literal, got: {}",
+            edit.new_text
+        );
+        assert!(
+            !edit.new_text.contains(r#""org.candlepin"#),
+            "Should not have FQN string anymore"
+        );
+
+        // Should have an import marker in the first edit's new_text
+        // (markers are resolved by post_process_lines, not as separate edits)
+        assert!(
+            edit.new_text.contains("// __ADD_IMPORT:org.candlepin.hibernate.EmptyStringUserType"),
+            "Expected import marker in edit, got: {}",
+            edit.new_text
+        );
+    }
+
+    #[test]
+    fn test_annotation_param_rewrite_library_type_falls_through() {
+        // When the FQN is a library type (org.hibernate.*), the pattern fix
+        // should return None — the class may have been removed in the new version.
+        // The LLM phase will handle the correct replacement.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Bar.java");
+        std::fs::write(
+            &file,
+            r#"package com.example;
+
+import org.hibernate.annotations.Type;
+
+public class Bar {
+    @Type(type = "org.hibernate.type.NumericBooleanType")
+    private boolean locked;
+}
+"#,
+        )
+        .unwrap();
+
+        let incident = Incident {
+            file_uri: format!("file://{}", file.display()),
+            line_number: Some(6),
+            code_location: None,
+            message: String::new(),
+            code_snip: None,
+            variables: BTreeMap::new(),
+            effort: None,
+            links: Vec::new(),
+            is_dependency_incident: false,
+        };
+        let mut report = FixReport::new();
+
+        let fix = plan_java_annotation_param_rewrite(
+            "test-rule",
+            &incident,
+            "type",
+            "value",
+            "StringFqnToClassLiteral",
+            &file,
+            &mut report,
+        );
+
+        // Library types should fall through to LLM (no edits → returns None)
+        assert!(
+            fix.is_none(),
+            "Library types should fall through to LLM"
+        );
+    }
+
+    #[test]
+    fn test_annotation_param_rewrite_identity() {
+        // Test identity transform: just rename the param, keep the value
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Baz.java");
+        std::fs::write(
+            &file,
+            r#"package com.example;
+
+public class Baz {
+    @SomeAnnotation(oldName = "someValue")
+    private String field;
+}
+"#,
+        )
+        .unwrap();
+
+        let incident = Incident {
+            file_uri: format!("file://{}", file.display()),
+            line_number: Some(4),
+            code_location: None,
+            message: String::new(),
+            code_snip: None,
+            variables: BTreeMap::new(),
+            effort: None,
+            links: Vec::new(),
+            is_dependency_incident: false,
+        };
+        let mut report = FixReport::new();
+
+        let fix = plan_java_annotation_param_rewrite(
+            "test-rule",
+            &incident,
+            "oldName",
+            "newName",
+            "Identity",
+            &file,
+            &mut report,
+        );
+
+        assert!(fix.is_some(), "Expected a planned fix for identity rename");
+        let fix = fix.unwrap();
+        let edit = fix.edits.first().unwrap();
+        assert!(
+            edit.new_text.contains("newName"),
+            "Expected renamed param in: {}",
+            edit.new_text
+        );
+        assert!(
+            !edit.new_text.contains("oldName"),
+            "Old param should be gone in: {}",
+            edit.new_text
+        );
     }
 }
