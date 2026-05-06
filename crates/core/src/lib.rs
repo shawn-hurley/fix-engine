@@ -321,6 +321,9 @@ pub enum FixStrategy {
     EnsureDependency {
         package: String,
         new_version: String,
+        /// Original package name/coordinate to search for when running proactively
+        /// (i.e., when kantra didn't fire any incidents for this rule).
+        old_package: Option<String>,
     },
     /// Java-specific import + class rename. Replaces the import statement
     /// and does word-boundary-aware replacement of the class name throughout
@@ -329,6 +332,18 @@ pub enum FixStrategy {
     JavaImportRename {
         old_fqn: String,
         new_fqn: String,
+    },
+    /// Java annotation parameter rewrite: changes an annotation's element name
+    /// and optionally transforms its value. For example:
+    /// `@Type(type = "com.example.Foo")` → `@Type(value = Foo.class)`
+    ///
+    /// `value_transform`: how to convert the old value to the new one.
+    /// - `"StringFqnToClassLiteral"`: `"com.example.Foo"` → `Foo.class` (adds import)
+    /// - `"Identity"`: keep the value as-is, just rename the param
+    AnnotationParamRewrite {
+        old_param: String,
+        new_param: String,
+        value_transform: String,
     },
     /// No auto-fix available -- flag for manual review.
     Manual,
@@ -399,6 +414,7 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
                 FixStrategy::EnsureDependency {
                     package: package.clone(),
                     new_version: new_version.clone(),
+                    old_package: entry.old_package.clone(),
                 }
             } else {
                 FixStrategy::Manual
@@ -434,6 +450,27 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
                 }
             } else {
                 FixStrategy::Manual
+            }
+        }
+        // Java annotation parameter rewrite: e.g., @Type(type = "fqn") → @Type(value = Cls.class)
+        "AnnotationParamRewrite" => {
+            if let (Some(from), Some(to)) = (&entry.from, &entry.to) {
+                // from = old param name (e.g., "type"), to = new param name (e.g., "value")
+                // value_transform is stored in the `replacement` field
+                let transform = entry
+                    .replacement
+                    .as_deref()
+                    .unwrap_or("StringFqnToClassLiteral")
+                    .to_string();
+                FixStrategy::AnnotationParamRewrite {
+                    old_param: from.clone(),
+                    new_param: to.clone(),
+                    value_transform: transform,
+                }
+            } else {
+                FixStrategy::Llm {
+                    context: Some(format_strategy_context(entry)),
+                }
             }
         }
         // Java-specific strategies from semver-analyzer
@@ -840,6 +877,7 @@ mod tests {
             FixStrategy::EnsureDependency {
                 package,
                 new_version,
+                ..
             } => {
                 assert_eq!(package, "@patternfly/react-core");
                 assert_eq!(new_version, "^6.0.0");

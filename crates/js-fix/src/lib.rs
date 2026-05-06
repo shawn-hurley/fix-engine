@@ -41,7 +41,7 @@ impl LanguageFixProvider for JsFixProvider {
         path.components().any(|c| c.as_os_str() == "node_modules")
     }
 
-    fn post_process_lines(&self, lines: &mut [String]) {
+    fn post_process_lines(&self, lines: &mut Vec<String>) {
         dedup_import_specifiers(lines);
     }
 

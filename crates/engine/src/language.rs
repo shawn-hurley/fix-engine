@@ -30,8 +30,8 @@ pub trait LanguageFixProvider: Send + Sync {
     ///
     /// Called once per file after all text edits are applied. Implementations
     /// can use this to clean up language-specific artifacts (e.g., deduplicating
-    /// import specifiers after renames produce duplicates).
-    fn post_process_lines(&self, lines: &mut [String]);
+    /// import specifiers after renames, resolving pending import markers).
+    fn post_process_lines(&self, lines: &mut Vec<String>);
 
     /// Plan an attribute/prop removal fix.
     ///
@@ -109,6 +109,30 @@ pub trait LanguageFixProvider: Send + Sync {
         Vec::new()
     }
 
+    /// Plan an annotation parameter rewrite.
+    ///
+    /// Rewrites annotation element names and optionally transforms values.
+    /// For example: `@Type(type = "com.example.Foo")` → `@Type(value = Foo.class)`.
+    ///
+    /// `value_transform` controls how the old value becomes the new value:
+    /// - `"StringFqnToClassLiteral"`: `"com.example.Foo"` → `Foo.class` (adds import)
+    /// - `"Identity"`: keep the value as-is, just rename the param
+    ///
+    /// Default: returns `None` (not supported).
+    #[allow(unused_variables)]
+    fn plan_annotation_param_rewrite(
+        &self,
+        rule_id: &str,
+        incident: &Incident,
+        old_param: &str,
+        new_param: &str,
+        value_transform: &str,
+        file_path: &Path,
+        report: &mut FixReport,
+    ) -> Option<PlannedFix> {
+        None
+    }
+
     /// Plan a language-specific import rename.
     ///
     /// Given an incident flagging an import for class/type rename, produce a
@@ -127,6 +151,47 @@ pub trait LanguageFixProvider: Send + Sync {
         report: &mut FixReport,
     ) -> Option<PlannedFix> {
         None
+    }
+
+    /// Proactively scan manifest files for a dependency to update.
+    ///
+    /// Called for `EnsureDependency` strategies where kantra didn't fire any
+    /// incidents (e.g., because kantra doesn't dispatch dependency conditions
+    /// to external providers). Scans the project root for manifest files
+    /// containing `old_package` and produces fixes to update them.
+    ///
+    /// Default: returns empty vec (no proactive dependency support).
+    #[allow(unused_variables)]
+    fn plan_proactive_dependency(
+        &self,
+        rule_id: &str,
+        old_package: &str,
+        new_package: &str,
+        new_version: &str,
+        project_root: &Path,
+        report: &mut FixReport,
+    ) -> Vec<PlannedFix> {
+        Vec::new()
+    }
+
+    /// Scan config files (XML, properties, YAML, Gradle) for FQN references
+    /// and produce rename edits.
+    ///
+    /// Called for `JavaImportRename` strategies to handle FQN strings in
+    /// non-source config files (e.g., `persistence.xml`, `hibernate.cfg.xml`,
+    /// `application.properties`).
+    ///
+    /// Default: returns empty vec (no config file FQN support).
+    #[allow(unused_variables)]
+    fn plan_config_file_renames(
+        &self,
+        rule_id: &str,
+        old_fqn: &str,
+        new_fqn: &str,
+        project_root: &Path,
+        report: &mut FixReport,
+    ) -> Vec<PlannedFix> {
+        Vec::new()
     }
 
     /// Capture baseline state before edits are written to disk.
@@ -177,7 +242,7 @@ impl LanguageFixProvider for NoOpLanguageFixProvider {
         false
     }
 
-    fn post_process_lines(&self, _lines: &mut [String]) {
+    fn post_process_lines(&self, _lines: &mut Vec<String>) {
         // No post-processing
     }
 
