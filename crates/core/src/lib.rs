@@ -495,6 +495,12 @@ pub fn strategy_entry_to_fix_strategy(entry: &FixStrategyEntry) -> FixStrategy {
         "UpdateSignature" => FixStrategy::Llm {
             context: Some(format_strategy_context(entry)),
         },
+        // Bulk constant/token group from semver-analyzer.  The individual
+        // constants may have been collapsed into a single combined rule.
+        // Route to LLM so it can apply per-symbol fixes from the message.
+        "ConstantGroup" => FixStrategy::Llm {
+            context: Some(format_strategy_context(entry)),
+        },
         "ManualReview" => FixStrategy::Manual,
         _ => FixStrategy::Manual,
     }

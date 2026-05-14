@@ -293,6 +293,16 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
     let phase = progress.start_phase("Planning fixes...");
     let mut plan = engine::plan_fixes(&output, &project, &merged_strategies, lang.as_ref(), &mut report)?;
 
+    // Enrich cross-package EnsureDependency requests with family labels.
+    // This bridges requests from one package's analysis (e.g., react-core saying
+    // "add react-drag-drop") to family entries from the target package's analysis
+    // (e.g., family:DragDrop with DragDropSort composition info).
+    engine::enrich_cross_package_requests(
+        &mut plan.pending_llm,
+        &merged_strategies,
+        &family_entries,
+    );
+
     // Consolidate family-grouped LLM requests.
     let mut consolidated_count = 0;
     if !family_entries.is_empty() {

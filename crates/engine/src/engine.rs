@@ -564,9 +564,21 @@ pub fn plan_fixes(
     // line has already been replaced.
     merge_dependency_inserts(&mut plan);
 
-    // Sort edits within each file by line number (descending) so we can apply bottom-up
+    // Sort edits within each file by line number (descending) so we can apply
+    // bottom-up, then by max old_text length (descending) within the same line
+    // so that more specific edits run before catch-all edits.  This matches the
+    // assumption in `deduplicate_edits()` that "the longer edit is applied first"
+    // when both edits use `replace_all`.  Without the secondary sort, a short
+    // catch-all edit can mutate the line before the specific edit, causing the
+    // specific edit's old_text to no longer match.
     for fixes in plan.files.values_mut() {
-        fixes.sort_by_key(|f| std::cmp::Reverse(f.line));
+        fixes.sort_by(|a, b| {
+            b.line.cmp(&a.line).then_with(|| {
+                let a_max = a.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                let b_max = b.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                b_max.cmp(&a_max)
+            })
+        });
     }
 
     // Deduplicate overlapping edits: when multiple edits target the same line
@@ -982,6 +994,63 @@ fn deduplicate_edits(plan: &mut FixPlan) {
 
 /// Consolidate LLM fix requests by component family when a family-level
 /// strategy exists. Multiple rules targeting the same `(file, family)` are
+/// Connect cross-package `EnsureDependency` LLM requests to family entries
+/// from the target package's analysis.
+///
+/// When the semver-analyzer runs against multiple packages (e.g., `react-core`
+/// and `react-drag-drop`), each strategy entry carries a `source_package` field
+/// identifying which package's analysis produced it. An `EnsureDependency` rule
+/// from `react-core` may point to `react-drag-drop` as the target package, and
+/// a `family:DragDrop` entry from the `react-drag-drop` analysis has
+/// `source_package = "@patternfly/react-drag-drop"`.
+///
+/// This function bridges the gap: for each pending LLM request originating from
+/// an `EnsureDependency` rule, it checks if the target package matches any
+/// family entry's `source_package`. If so, it adds a `family=FamilyName` label
+/// to the request so that [`consolidate_family_requests`] can later pull in the
+/// full family migration context (target structure, prop mappings, etc.).
+pub fn enrich_cross_package_requests(
+    requests: &mut [LlmFixRequest],
+    strategies: &BTreeMap<String, FixStrategy>,
+    family_entries: &BTreeMap<String, FixStrategyEntry>,
+) {
+    if family_entries.is_empty() {
+        return;
+    }
+
+    // Build index: source_package -> family name (e.g., "@patternfly/react-drag-drop" -> "DragDrop").
+    let mut package_to_family: HashMap<String, String> = HashMap::new();
+    for (key, entry) in family_entries {
+        if let Some(ref src_pkg) = entry.source_package {
+            if let Some(family_name) = key.strip_prefix("family:") {
+                package_to_family
+                    .entry(src_pkg.clone())
+                    .or_insert_with(|| family_name.to_string());
+            }
+        }
+    }
+
+    if package_to_family.is_empty() {
+        return;
+    }
+
+    for req in requests.iter_mut() {
+        // Skip requests that already have a family label.
+        if req.labels.iter().any(|l| l.starts_with("family=")) {
+            continue;
+        }
+
+        // Check if this request's rule is an EnsureDependency.
+        if let Some(FixStrategy::EnsureDependency { ref package, .. }) =
+            strategies.get(&req.rule_id)
+        {
+            if let Some(family_name) = package_to_family.get(package) {
+                req.labels.push(format!("family={}", family_name));
+            }
+        }
+    }
+}
+
 /// merged into a single request with a unified message containing the target
 /// component structure and all incident variables.
 ///
@@ -1139,6 +1208,15 @@ pub fn consolidate_family_requests(
                         message.push_str(&format!(
                             "  {} -> {} (renamed, type unchanged)\n",
                             p.old_name, p.new_name
+                        ));
+                    } else {
+                        // Same name, same type — still show it so the LLM
+                        // knows this prop carries over from the deprecated
+                        // component unchanged.
+                        let typ = p.new_type.as_deref().unwrap_or("?");
+                        message.push_str(&format!(
+                            "  {}: {} (unchanged)\n",
+                            p.new_name, typ
                         ));
                     }
                 }
@@ -2532,6 +2610,73 @@ export {
             .collect();
         assert_eq!(edits.len(), 1, "Exact duplicate should be removed");
         assert_eq!(plan.edits_subsumed, 1);
+    }
+
+    // ── apply_fixes ordering tests ──────────────────────────────────
+
+    #[test]
+    fn test_apply_fixes_specific_before_catchall_on_same_line() {
+        // TC081 scenario: a specific CSS variable rename and a catch-all
+        // prefix rename both target the same line.  The specific rule has
+        // a longer `old_text` and should run first so the catch-all doesn't
+        // clobber it.
+        //
+        // Without longest-first ordering within a line, the catch-all may
+        // run first, mutating the line so the specific rule can't find its
+        // `old_text` anymore.
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let css_file = dir.path().join("test.css");
+        {
+            let mut f = std::fs::File::create(&css_file).expect("create file");
+            writeln!(f, ".custom-element {{").unwrap();
+            writeln!(f, "  padding: var(--pf-v5-global--spacer--md);").unwrap();
+            writeln!(f, "}}").unwrap();
+        }
+
+        let mut plan = FixPlan::default();
+        // Insert catch-all FIRST to simulate the worst-case ordering
+        plan.files.insert(
+            css_file.clone(),
+            vec![
+                make_edit(2, "--pf-v5-global--", "--pf-t--global--", true),
+                make_edit(2, "--pf-v5-global--spacer--md", "--pf-t--global--spacer--300", true),
+            ],
+        );
+
+        // Run the same sort + dedup that plan_fixes performs
+        for fixes in plan.files.values_mut() {
+            fixes.sort_by(|a, b| {
+                b.line.cmp(&a.line).then_with(|| {
+                    let a_max = a.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                    let b_max = b.edits.iter().map(|e| e.old_text.len()).max().unwrap_or(0);
+                    b_max.cmp(&a_max)
+                })
+            });
+        }
+        deduplicate_edits(&mut plan);
+
+        let noop = crate::language::NoOpLanguageFixProvider;
+        let result = apply_fixes(&plan, &noop, dir.path()).expect("apply_fixes");
+
+        let output = std::fs::read_to_string(&css_file).expect("read result");
+        assert!(
+            output.contains("--pf-t--global--spacer--300"),
+            "Specific rename should have won. Got: {}",
+            output,
+        );
+        assert!(
+            !output.contains("--pf-v5-global--"),
+            "No v5 prefixes should remain. Got: {}",
+            output,
+        );
+        // The specific edit runs first (succeeds), the catch-all runs second
+        // (old_text not found → failed but harmless).
+        assert!(
+            result.edits_applied >= 1,
+            "At least the specific edit should succeed"
+        );
     }
 
     // ── merge_ensure_dependency_versions tests ──────────────────────

@@ -1541,16 +1541,19 @@ Code context:
 {code_context}
 ```
 
+CRITICAL — CHARACTER PRESERVATION:
+All special characters in the file must remain as Unicode. Do NOT replace Unicode punctuation (such as curly quotes, em dashes, or other non-ASCII characters) with ASCII equivalents. Doing so will cause syntax errors and your fix will be automatically reverted.
+
 Instructions:
 1. Read the file at {file_path}
 {step2}
 3. Make the minimum edit necessary — do not change unrelated code, but you MUST clean up all artifacts caused by your change. Specifically: if your edit introduces a new type or component reference (e.g., MenuToggleElement, ModalHeader), ADD the import for it. If your edit makes an import binding unused, REMOVE that binding from the import statement (or remove the entire import if all bindings are unused). Similarly, delete any dead variable declarations, unused helper functions, or orphaned type imports that your change made redundant. Do NOT leave unused imports "just in case" — the file must compile and pass strict no-unused-vars linting after your edit.
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
-5. Write the fixed file. IMPORTANT: Preserve all Unicode characters exactly as they appear in the original file — do NOT normalize curly quotes (\u2018 \u2019 \u201C \u201D), em dashes (\u2014), or other non-ASCII characters to ASCII equivalents. Replacing e.g. \u2019 with ' inside a single-quoted string creates a syntax error.
+5. Write the fixed file. All special characters must remain as Unicode — do not downgrade to ASCII (see CHARACTER PRESERVATION above).
 6. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 
-Before writing, reason through the fix step by step to ensure nothing is missed. Then read the file, make the edit, and write it.
+Before writing, reason through the fix step by step to ensure nothing is missed. Verify that only the lines affected by the fixes were changed and that all special characters remain as Unicode. Then read the file, make the edit, and write it.
 
 After writing the file, produce a '## Changes Applied' section that lists the change you made, or note if the fix was already applied or could not be applied (with a brief reason)."#,
         migration_desc = ctx.migration_description(),
@@ -1763,6 +1766,9 @@ File: {file_path}
 {test_files_section}{context_section}{high_violation_preamble}
 Apply ALL of the following {count} fixes to this file:
 {fixes}
+CRITICAL — CHARACTER PRESERVATION:
+All special characters in the file must remain as Unicode. Do NOT replace Unicode punctuation (such as curly quotes, em dashes, or other non-ASCII characters) with ASCII equivalents. Doing so will cause syntax errors and your fix will be automatically reverted.
+
 Instructions:
 1. Read the file at {file_path}
 2. Process each fix INDEPENDENTLY in sequence. For each fix:
@@ -1772,11 +1778,11 @@ Instructions:
 3. Make the minimum edits necessary — do not change unrelated code, but you MUST clean up all artifacts caused by your changes. Specifically: if your edits introduce a new type or component reference (e.g., MenuToggleElement, ModalHeader), ADD the import for it. If your edits make an import binding unused, REMOVE that binding from the import statement (or remove the entire import if all bindings are unused). Similarly, delete any dead variable declarations, unused helper functions, or orphaned type imports that your changes made redundant. Do NOT leave unused imports "just in case" — the file must compile and pass strict no-unused-vars linting after your edits.
 4. After determining your changes, reason through any functional side effects: verify that your edits preserve the existing behavior of the surrounding code. If a migration change makes existing variables, state, or logic redundant, clean up the affected code so the file remains correct and consistent.
 5. Do NOT revert any changes that were already applied in previous passes
-6. Write the fixed file once with ALL changes from every fix applied. IMPORTANT: Preserve all Unicode characters exactly as they appear in the original file — do NOT normalize curly quotes (\u2018 \u2019 \u201C \u201D), em dashes (\u2014), or other non-ASCII characters to ASCII equivalents. Replacing e.g. \u2019 with ' inside a single-quoted string creates a syntax error.
+6. Write the fixed file once with ALL changes from every fix applied. All special characters must remain as Unicode — do not downgrade to ASCII (see CHARACTER PRESERVATION above).
 7. REQUIRED: If companion test files are listed above, read EACH one now. Do NOT skip this step. For each test file, check whether your changes to the main file would cause test failures. If a test would break, apply the fix and write the updated test file.
 {constraints_section}
 {verification_section}
-Before writing, reason through each fix step by step to ensure nothing is missed. Then read the file, make the edits, and write it.
+Before writing, reason through each fix step by step to ensure nothing is missed. Verify that only the lines affected by the fixes were changed and that all special characters remain as Unicode. Then read the file, make the edits, and write it.
 
 After writing the file, produce a '## Changes Applied' section that lists each change you made, each fix that was already applied (no change needed), and each fix you could not apply (with a brief reason). This summary is used by subsequent processing steps."#,
         migration_desc = ctx.migration_description(),
