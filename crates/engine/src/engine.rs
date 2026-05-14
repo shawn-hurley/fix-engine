@@ -1233,6 +1233,12 @@ pub fn consolidate_family_requests(
                     dm.removed_props.join(", ")
                 ));
             }
+            if !dm.appearance_notes.is_empty() {
+                message.push_str("Appearance/variant notes:\n");
+                for note in &dm.appearance_notes {
+                    message.push_str(&format!("  IMPORTANT: {}\n", note));
+                }
+            }
         }
 
         // Collect all incident data from the grouped requests.
