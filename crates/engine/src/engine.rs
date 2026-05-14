@@ -1110,7 +1110,8 @@ pub fn consolidate_family_requests(
 
         if let Some(ref target) = entry.target_structure {
             message.push_str(&format!(
-                "\nTarget structure (correct v6 composition):\n```jsx\n{}\n```\n",
+                "\nReference: v6 component API (DO NOT restructure code to match this — \
+                 only make changes described by the incidents below):\n```jsx\n{}\n```\n",
                 target
             ));
         }
