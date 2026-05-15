@@ -1544,6 +1544,10 @@ Code context:
 CRITICAL — CHARACTER PRESERVATION:
 All special characters in the file must remain as Unicode. Do NOT replace Unicode punctuation (such as curly quotes, em dashes, or other non-ASCII characters) with ASCII equivalents. Doing so will cause syntax errors and your fix will be automatically reverted.
 
+CRITICAL — TOKEN/VARIABLE RENAMING:
+When renaming React tokens (from @patternfly/react-tokens), only add the `t_` prefix to the existing name. Do NOT change the base token name (e.g., `global_spacer_md` → `t_global_spacer_md`, NOT `t_global_spacer_300`).
+When renaming CSS custom properties, use the `--pf-v6-` prefix, NOT `--pf-t--` (e.g., `--pf-v5-global--spacer--md` → `--pf-v6-global--spacer--md`).
+
 Instructions:
 1. Read the file at {file_path}
 {step2}
@@ -1768,6 +1772,10 @@ Apply ALL of the following {count} fixes to this file:
 {fixes}
 CRITICAL — CHARACTER PRESERVATION:
 All special characters in the file must remain as Unicode. Do NOT replace Unicode punctuation (such as curly quotes, em dashes, or other non-ASCII characters) with ASCII equivalents. Doing so will cause syntax errors and your fix will be automatically reverted.
+
+CRITICAL — TOKEN/VARIABLE RENAMING:
+When renaming React tokens (from @patternfly/react-tokens), only add the `t_` prefix to the existing name. Do NOT change the base token name (e.g., `global_spacer_md` → `t_global_spacer_md`, NOT `t_global_spacer_300`).
+When renaming CSS custom properties, use the `--pf-v6-` prefix, NOT `--pf-t--` (e.g., `--pf-v5-global--spacer--md` → `--pf-v6-global--spacer--md`).
 
 Instructions:
 1. Read the file at {file_path}

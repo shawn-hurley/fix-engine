@@ -743,6 +743,52 @@ pub fn load_strategies_and_families(
     Ok((strategies, families))
 }
 
+/// Check if an LLM violation is still fresh by comparing its code_snip
+/// against the current file content. Returns `true` if the violation
+/// appears to still apply, `false` if it looks stale (already fixed).
+///
+/// Used to filter out violations that were resolved by the pattern-fix
+/// phase before sending to the LLM.
+pub fn is_violation_fresh(
+    code_snip: Option<&str>,
+    line: u32,
+    current_content: &str,
+) -> bool {
+    let snip = match code_snip {
+        Some(s) => s,
+        None => return true, // no snippet to compare — assume fresh
+    };
+
+    let target_prefix = format!("{}", line);
+    let key_text = snip
+        .lines()
+        .find(|l| {
+            let trimmed = l.trim_start();
+            trimmed.starts_with(&target_prefix)
+                && trimmed[target_prefix.len()..]
+                    .starts_with(|c: char| !c.is_ascii_digit())
+        })
+        .map(|l| {
+            let trimmed = l.trim_start();
+            let after_num = &trimmed[target_prefix.len()..];
+            after_num.trim().to_string()
+        });
+
+    let key = match key_text {
+        Some(ref k) if k.len() > 5 => k,
+        _ => return true, // snippet too short to compare — assume fresh
+    };
+
+    let lines: Vec<&str> = current_content.lines().collect();
+    let start = (line as usize).saturating_sub(6);
+    let end = ((line as usize) + 5).min(lines.len());
+    if start >= lines.len() {
+        return true; // file shorter than expected — assume fresh
+    }
+    let window = &lines[start..end];
+    window.iter().any(|l| l.trim() == key.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1040,50 @@ mod tests {
         assert_eq!(entry.mappings.len(), 2);
         assert_eq!(entry.mappings[0].from.as_deref(), Some("Chip"));
         assert_eq!(entry.mappings[0].to.as_deref(), Some("Label"));
+    }
+
+    /// Fix 13: is_violation_fresh should return false when the code snippet
+    /// text no longer exists at the expected line in the current file.
+    #[test]
+    fn test_violation_fresh_when_code_matches() {
+        let snip = "    8        <AccordionItem>\n    9          <AccordionToggle isExpanded={expanded}>\n   10            Item One";
+        let content = "import React from 'react';\n\nconst App = () => (\n  <Accordion>\n    <AccordionItem>\n      <AccordionToggle isExpanded={expanded}>\n        Item One\n      </AccordionToggle>\n    </AccordionItem>\n  </Accordion>\n);";
+
+        // Line 9 text exists in the content near line 9 → fresh
+        assert!(
+            is_violation_fresh(Some(snip), 9, content),
+            "Should be fresh when code snippet matches current file"
+        );
+    }
+
+    #[test]
+    fn test_violation_stale_when_code_changed() {
+        let snip = "    8        <AccordionItem>\n    9          <AccordionToggle isExpanded={expanded}>\n   10            Item One";
+        // The isExpanded prop was removed by pattern fix
+        let content = "import React from 'react';\n\nconst App = () => (\n  <Accordion>\n    <AccordionItem>\n      <AccordionToggle>\n        Item One\n      </AccordionToggle>\n    </AccordionItem>\n  </Accordion>\n);";
+
+        // Line 9 text no longer matches → stale
+        assert!(
+            !is_violation_fresh(Some(snip), 9, content),
+            "Should be stale when code snippet no longer matches"
+        );
+    }
+
+    #[test]
+    fn test_violation_fresh_no_snippet() {
+        assert!(
+            is_violation_fresh(None, 5, "any content"),
+            "No snippet → assume fresh"
+        );
+    }
+
+    #[test]
+    fn test_violation_fresh_short_snippet() {
+        // Snippet line text too short (<=5 chars) → assume fresh
+        let snip = "    9  x";
+        assert!(
+            is_violation_fresh(Some(snip), 9, "anything"),
+            "Short snippet text → assume fresh"
+        );
     }
 }

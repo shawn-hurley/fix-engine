@@ -391,6 +391,47 @@ pub async fn run(opts: FixOpts, progress: &crate::progress::ProgressReporter) ->
         }
     }
 
+    // ── Filter stale LLM violations after pattern fixes ─────────────
+    //
+    // When running in single-invocation mode (pattern + LLM in one run),
+    // the pending_llm entries carry the original code_snip from the kantra
+    // output. Pattern fixes may have already resolved some of these
+    // violations. Check if the key text from each violation's code snippet
+    // still exists near the original line in the current file.
+    if should_apply && !plan.pending_llm.is_empty() {
+        let pre_filter_count = plan.pending_llm.len();
+        plan.pending_llm.retain(|req| {
+            let content = match std::fs::read_to_string(&req.file_path) {
+                Ok(c) => c,
+                Err(_) => return true, // keep if can't read
+            };
+
+            let fresh = fix_engine_core::is_violation_fresh(
+                req.code_snip.as_deref(),
+                req.line,
+                &content,
+            );
+            if !fresh {
+                tracing::debug!(
+                    rule = %req.rule_id,
+                    file = %req.file_path.display(),
+                    line = req.line,
+                    "Filtering stale LLM violation \
+                     (original code no longer at expected location)"
+                );
+            }
+            fresh
+        });
+        let filtered = pre_filter_count - plan.pending_llm.len();
+        if filtered > 0 {
+            progress.println(&format!(
+                "  {} Filtered {} stale violation(s) already resolved by pattern fixes",
+                "info:".cyan().bold(),
+                filtered,
+            ));
+        }
+    }
+
     // ── LLM-assisted fixes ───────────────────────────────────────────
     let llm_provider = opts.llm_provider.as_ref().or_else(|| {
         if opts.llm_endpoint.is_some() {
